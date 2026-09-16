@@ -11,26 +11,61 @@ const API_URL = 'https://script.google.com/macros/s/AKfycbzKoIi0o60A8Nnz8UtABojL
 let TOKEN = null;
 let SESION = null;
 let DATA = {};
-let LISTO = false;
-let VISTA_PENDIENTE = null;
+let VISTA_ACTUAL = null;
 
-/* ============ LLAMADAS A LA API ============ */
-async function api(action, data) {
-  const res = await fetch(API_URL, {
-  method: 'POST',
-  body: JSON.stringify({ action, token: TOKEN, data: data || {} }),
-  redirect: 'follow'
-});
-  if (!res.ok) throw new Error('Sin conexión con el servidor (' + res.status + ')');
-  const j = await res.json();
-  if (!j.ok) {
-    if (j.error === 'SESION_EXPIRADA') { cerrarSesion(true); throw new Error('Tu sesión expiró. Entra de nuevo.'); }
-    throw new Error(j.error || 'Error desconocido');
+/* =================================================================
+   LLAMADAS A LA API
+   Con reintento automatico: Apps Script redirige cada peticion a
+   googleusercontent.com y ese salto falla de vez en cuando (404).
+   Antes de rendirse lo intenta 3 veces.
+   ================================================================= */
+async function api(action, data, intentos) {
+  intentos = (intentos === undefined) ? 3 : intentos;
+  let ultimoError = null;
+
+  for (let i = 0; i < intentos; i++) {
+    try {
+      const res = await fetch(API_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify({ action, token: TOKEN, data: data || {} })
+      });
+
+      if (!res.ok) {
+        // 404 / 5xx: fallo del salto de Google, vale la pena reintentar
+        ultimoError = new Error('Servidor no disponible (' + res.status + ')');
+        if (i < intentos - 1) { await espera(350 * (i + 1)); continue; }
+        throw ultimoError;
+      }
+
+      const j = await res.json();
+      if (!j.ok) {
+        // Error de negocio: NO se reintenta, es una respuesta legitima
+        if (j.error === 'SESION_EXPIRADA') {
+          cerrarSesion(true);
+          throw new Error('Tu sesión expiró. Entra de nuevo.');
+        }
+        throw new Error(j.error || 'Error desconocido');
+      }
+      return j.result;
+
+    } catch (e) {
+      // Errores de negocio y de sesion salen de inmediato
+      if (e && e.message && (e.message.indexOf('sesión expiró') >= 0 ||
+          (e.message.indexOf('Servidor no disponible') < 0 && e.name !== 'TypeError'))) {
+        throw e;
+      }
+      ultimoError = e;
+      if (i < intentos - 1) { await espera(350 * (i + 1)); continue; }
+    }
   }
-  return j.result;
+  throw ultimoError || new Error('No hay conexión con el servidor.');
 }
+function espera(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-/* ============ UTILIDADES ============ */
+/* =================================================================
+   UTILIDADES
+   ================================================================= */
 const $ = (id) => document.getElementById(id);
 function val(id) { const e = $(id); return e ? e.value : ''; }
 function esc(s) {
@@ -38,53 +73,145 @@ function esc(s) {
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
+/** Normaliza texto: quita acentos y pasa a minusculas.
+    Asi "jose" encuentra "José" y "limon" encuentra "Limón". */
+function norm(s) {
+  return String(s == null ? '' : s)
+    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase().trim();
+}
+/** Busca un texto dentro de otro ignorando acentos y mayusculas. */
+function contiene(texto, busqueda) {
+  return norm(texto).indexOf(norm(busqueda)) >= 0;
+}
 function money(n) {
   const m = (DATA.negocio ? DATA.negocio.moneda : 'C$');
   return m + ' ' + Number(n || 0).toLocaleString('es-NI', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
-function beep() {
+
+/* =================================================================
+   SONIDO
+   Los navegadores bloquean el audio hasta que el usuario toca algo.
+   Lo desbloqueamos en el primer toque y reutilizamos el contexto.
+   ================================================================= */
+let AUDIO = null;
+function desbloquearAudio() {
   try {
-    const c = new (window.AudioContext || window.webkitAudioContext)();
-    const o = c.createOscillator(); o.type = 'square'; o.frequency.value = 900;
-    const g = c.createGain(); g.gain.value = 0.08;
-    o.connect(g); g.connect(c.destination); o.start();
-    setTimeout(() => { o.stop(); c.close(); }, 80);
+    if (!AUDIO) AUDIO = new (window.AudioContext || window.webkitAudioContext)();
+    if (AUDIO.state === 'suspended') AUDIO.resume();
   } catch (e) {}
 }
-function vibrar(ms) { try { if (navigator.vibrate) navigator.vibrate(ms || 40); } catch (e) {} }
+document.addEventListener('click', desbloquearAudio, { once: false });
+document.addEventListener('touchstart', desbloquearAudio, { once: false });
+
+function tono(freq, dur, vol) {
+  try {
+    desbloquearAudio();
+    if (!AUDIO) return;
+    const o = AUDIO.createOscillator(), g = AUDIO.createGain();
+    o.type = 'sine'; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol || 0.22, AUDIO.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, AUDIO.currentTime + dur / 1000);
+    o.connect(g); g.connect(AUDIO.destination);
+    o.start(); o.stop(AUDIO.currentTime + dur / 1000);
+  } catch (e) {}
+}
+/** Dos notas ascendentes: lectura correcta. */
+function sonidoOk() { tono(1050, 90, 0.25); setTimeout(() => tono(1450, 110, 0.25), 85); }
+/** Nota grave: producto no encontrado o error. */
+function sonidoError() { tono(300, 220, 0.25); }
+/** Nota corta neutra: repetido / ya estaba. */
+function sonidoAviso() { tono(700, 80, 0.18); }
+function vibrar(ms) { try { if (navigator.vibrate) navigator.vibrate(ms || 45); } catch (e) {} }
+
+/* =================================================================
+   AVISOS FLOTANTES (toasts) Y DIALOGOS
+   Sustituyen los alert() y confirm() feos del navegador.
+   ================================================================= */
+function contenedorToast() {
+  let c = $('toastWrap');
+  if (!c) {
+    c = document.createElement('div');
+    c.id = 'toastWrap'; c.className = 'toast-wrap';
+    document.body.appendChild(c);
+  }
+  return c;
+}
+/** tipo: 'ok' | 'error' | 'info' */
+function aviso(mensaje, tipo, ms) {
+  const icono = tipo === 'ok' ? '&#10003;' : (tipo === 'error' ? '&#9888;' : '&#8505;');
+  const t = document.createElement('div');
+  t.className = 'toast toast-' + (tipo || 'info');
+  t.innerHTML = '<span class="toast-ico">' + icono + '</span><span class="toast-txt">' + esc(mensaje) + '</span>';
+  contenedorToast().appendChild(t);
+  requestAnimationFrame(() => t.classList.add('entra'));
+  setTimeout(() => {
+    t.classList.remove('entra');
+    setTimeout(() => t.remove(), 260);
+  }, ms || 3200);
+}
+
+/** Dialogo de confirmacion con diseño propio. Devuelve una promesa. */
+function preguntar(opciones) {
+  const o = typeof opciones === 'string' ? { texto: opciones } : (opciones || {});
+  return new Promise((resolve) => {
+    const d = document.createElement('div');
+    d.className = 'modal-bg dialogo-bg';
+    d.innerHTML = '<div class="modal dialogo">'
+      + '<div class="dlg-ico ' + (o.peligro ? 'peligro' : '') + '">' + (o.icono || (o.peligro ? '&#9888;' : '&#63;')) + '</div>'
+      + '<h3>' + esc(o.titulo || '¿Confirmas?') + '</h3>'
+      + (o.texto ? '<p class="dlg-txt">' + esc(o.texto) + '</p>' : '')
+      + '<div class="modal-acts">'
+      + '<button class="btn ghost" id="dlgNo">' + esc(o.cancelar || 'Cancelar') + '</button>'
+      + '<button class="btn ' + (o.peligro ? 'danger-btn' : '') + '" id="dlgSi">' + esc(o.aceptar || 'Confirmar') + '</button>'
+      + '</div></div>';
+    document.body.appendChild(d);
+    requestAnimationFrame(() => d.classList.add('entra'));
+    const cerrar = (r) => {
+      d.classList.remove('entra');
+      setTimeout(() => d.remove(), 200);
+      resolve(r);
+    };
+    d.querySelector('#dlgSi').addEventListener('click', () => cerrar(true));
+    d.querySelector('#dlgNo').addEventListener('click', () => cerrar(false));
+    d.addEventListener('click', (ev) => { if (ev.target === d) cerrar(false); });
+    document.addEventListener('keydown', function onEsc(ev) {
+      if (ev.key === 'Escape') { document.removeEventListener('keydown', onEsc); cerrar(false); }
+    });
+  });
+}
+
 function abrirModal(html) {
   const d = document.createElement('div');
   d.className = 'modal-bg';
   d.innerHTML = html;
   d.addEventListener('click', (ev) => { if (ev.target === d) d.remove(); });
   document.body.appendChild(d);
+  requestAnimationFrame(() => d.classList.add('entra'));
   return d;
 }
 function cerrarModal() {
-  const m = document.querySelector('.modal-bg:not(.scan-bg)');
-  if (m) m.remove();
+  const m = document.querySelector('.modal-bg:not(.scan-bg):not(.dialogo-bg)');
+  if (m) { m.classList.remove('entra'); setTimeout(() => m.remove(), 180); }
 }
 
-/* ============ ARRANQUE ============ */
+/* =================================================================
+   ARRANQUE
+   ================================================================= */
 window.addEventListener('load', async () => {
-  // Registrar el service worker (hace que la app abra al instante y sea instalable)
   if ('serviceWorker' in navigator) {
     try { await navigator.serviceWorker.register('./sw.js'); } catch (e) { console.warn('SW:', e); }
   }
-  // Sesion guardada?
   TOKEN = localStorage.getItem('pos_token');
   const sesGuardada = localStorage.getItem('pos_sesion');
-  const marcaGuardada = localStorage.getItem('pos_marca');
-  if (marcaGuardada) { try { DATA.marca = JSON.parse(marcaGuardada); } catch (e) {} }
-  const negGuardado = localStorage.getItem('pos_negocio');
-  if (negGuardado) { try { DATA.negocio = JSON.parse(negGuardado); } catch (e) {} }
+  try { const m = localStorage.getItem('pos_marca'); if (m) DATA.marca = JSON.parse(m); } catch (e) {}
+  try { const n = localStorage.getItem('pos_negocio'); if (n) DATA.negocio = JSON.parse(n); } catch (e) {}
 
   if (TOKEN && sesGuardada) {
     try {
       SESION = JSON.parse(sesGuardada);
       $('splash').style.display = 'none';
       iniciarApp();
-      cargarDatosSegundoPlano();
       return;
     } catch (e) {}
   }
@@ -99,8 +226,7 @@ function mostrarLogin() {
     if (DATA.marca.logo) $('loginLogo').innerHTML = '<img src="' + DATA.marca.logo + '" class="brand-logo-lg">';
     if (DATA.marca.nombre) { $('loginTitle').textContent = DATA.marca.nombre; document.title = DATA.marca.nombre; }
   }
-  // Refrescar marca en segundo plano
-  api('marca').then((m) => {
+  api('marca', {}, 2).then((m) => {
     DATA.marca = m;
     localStorage.setItem('pos_marca', JSON.stringify(m));
     if (m.logo) $('loginLogo').innerHTML = '<img src="' + m.logo + '" class="brand-logo-lg">';
@@ -115,7 +241,7 @@ $('logUser').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('logP
 
 async function hacerLogin() {
   const msg = $('loginMsg');
-  msg.innerHTML = 'Verificando...';
+  msg.innerHTML = '<span class="cargando">Verificando<span class="pts"></span></span>';
   $('btnLogin').disabled = true;
   try {
     const r = await api('login', { usuario: val('logUser'), pin: val('logPin') });
@@ -129,22 +255,33 @@ async function hacerLogin() {
     msg.innerHTML = '';
     $('logPin').value = '';
     iniciarApp();
-    cargarDatosSegundoPlano();
+    aviso('Bienvenido, ' + SESION.Nombre.split(' ')[0], 'ok', 2600);
   } catch (e) {
     msg.innerHTML = '<span class="err">' + esc(e.message) + '</span>';
+    sonidoError();
   } finally {
     $('btnLogin').disabled = false;
   }
 }
 
-function cerrarSesion(silencioso) {
-  if (!silencioso && !confirm('¿Cerrar sesión?')) return;
-  TOKEN = null; SESION = null; DATA = { marca: DATA.marca, negocio: DATA.negocio };
-  LISTO = false; VISTA_PENDIENTE = null;
+async function cerrarSesion(silencioso) {
+  if (!silencioso) {
+    const ok = await preguntar({
+      titulo: 'Cerrar sesión',
+      texto: 'Tendrás que ingresar tu usuario y PIN de nuevo para volver a entrar.',
+      aceptar: 'Cerrar sesión', cancelar: 'Seguir aquí', peligro: true,
+      icono: '&#128274;'
+    });
+    if (!ok) return;
+  }
+  TOKEN = null; SESION = null;
+  DATA = { marca: DATA.marca, negocio: DATA.negocio };
+  VISTA_ACTUAL = null;
   localStorage.removeItem('pos_token');
   localStorage.removeItem('pos_sesion');
   cerrarScanner();
   mostrarLogin();
+  if (!silencioso) aviso('Sesión cerrada', 'info', 2400);
 }
 $('btnSalir').addEventListener('click', () => cerrarSesion(false));
 
@@ -169,19 +306,11 @@ function aplicarPermisos() {
     b.style.display = (map[b.dataset.view] === false) ? 'none' : '';
   });
 }
-async function cargarDatosSegundoPlano() {
-  try {
-    const d = await api('datosApp');
-    Object.assign(DATA, d);
-    LISTO = true;
-    if (VISTA_PENDIENTE) { const v = VISTA_PENDIENTE; VISTA_PENDIENTE = null; abrirVista(v); }
-  } catch (e) {
-    LISTO = true;
-    $('content').innerHTML = '<div class="placeholder"><h2>No se pudieron cargar los datos</h2><p>' + esc(e.message) + '</p><button class="btn" onclick="location.reload()">Reintentar</button></div>';
-  }
-}
 
-/* ============ NAVEGACION ============ */
+/* =================================================================
+   NAVEGACION CON CARGA POR MODULO
+   Cada pantalla pide solo sus datos, y solo la primera vez.
+   ================================================================= */
 $('burger').addEventListener('click', () => $('navWrap').classList.toggle('open'));
 document.querySelectorAll('.nav-btn[data-view]').forEach((b) => {
   b.addEventListener('click', () => {
@@ -192,8 +321,37 @@ document.querySelectorAll('.nav-btn[data-view]').forEach((b) => {
     abrirVista(b.dataset.view);
   });
 });
-function abrirVista(v) {
-  if (!LISTO) { VISTA_PENDIENTE = v; $('content').innerHTML = esqueleto(); return; }
+
+/** Qué datos necesita cada pantalla y con qué accion se traen. */
+const NECESITA = {
+  dashboard:  { claves: ['dashboard'], accion: 'datosApp' },
+  ventas:     { claves: ['catalogo', 'clientes'], accion: 'datosVentas' },
+  inventario: { claves: ['inventario', 'categorias'], accion: 'datosInventario' },
+  compras:    { claves: ['inventario', 'proveedores'], accion: 'datosCompras' },
+  clientes:   { claves: ['clientes'], accion: 'datosVentas' },
+  admin:      { claves: [], accion: null }
+};
+
+async function abrirVista(v) {
+  VISTA_ACTUAL = v;
+  const req = NECESITA[v];
+
+  if (req && req.accion) {
+    const falta = req.claves.some((k) => DATA[k] === undefined || DATA[k] === null);
+    if (falta) {
+      $('content').innerHTML = esqueleto(v);
+      try {
+        const d = await api(req.accion);
+        Object.assign(DATA, d);
+      } catch (e) {
+        if (VISTA_ACTUAL !== v) return;
+        $('content').innerHTML = pantallaError(e.message, v);
+        return;
+      }
+      if (VISTA_ACTUAL !== v) return; // el usuario ya se fue a otra pantalla
+    }
+  }
+
   if (v === 'dashboard') renderDashboard();
   else if (v === 'ventas') renderVentas();
   else if (v === 'inventario') renderInventario();
@@ -201,45 +359,64 @@ function abrirVista(v) {
   else if (v === 'clientes') renderClientes();
   else if (v === 'admin') renderAdmin();
 }
-function esqueleto() {
+function reintentarVista(v) { abrirVista(v); }
+
+function pantallaError(mensaje, vista) {
+  return '<div class="placeholder"><div class="ph-ico">&#9888;</div>'
+    + '<h2>No se pudieron cargar los datos</h2>'
+    + '<p>' + esc(mensaje) + '</p>'
+    + '<button class="btn" onclick="reintentarVista(\'' + vista + '\')">&#128260; Reintentar</button></div>';
+}
+function esqueleto(v) {
+  if (v === 'ventas' || v === 'compras') {
+    return '<div class="skel-wrap"><div class="skel-grid2">'
+      + '<div class="skel-panel alto"></div><div class="skel-panel alto"></div>'
+      + '</div><p class="skel-txt">Cargando<span class="pts"></span></p></div>';
+  }
+  if (v === 'inventario' || v === 'clientes') {
+    return '<div class="skel-wrap"><div class="skel-panel alto"></div>'
+      + '<p class="skel-txt">Cargando<span class="pts"></span></p></div>';
+  }
   return '<div class="skel-wrap"><div class="skel-grid">'
     + '<div class="skel-card"></div><div class="skel-card"></div><div class="skel-card"></div><div class="skel-card"></div>'
     + '</div><div class="skel-grid2"><div class="skel-panel"></div><div class="skel-panel"></div></div>'
-    + '<p class="skel-txt">Cargando datos...</p></div>';
+    + '<p class="skel-txt">Cargando<span class="pts"></span></p></div>';
 }
 
 /* =================================================================
    LECTOR DE CODIGOS DE BARRAS
-   Usa el lector NATIVO del navegador (BarcodeDetector) cuando existe
-   -mucho mas rapido y preciso con EAN/UPC-, y cae a html5-qrcode
-   solo si el dispositivo no lo soporta.
+   Lector nativo del navegador (BarcodeDetector) si existe, que es
+   mucho mas rapido y preciso con EAN/UPC; si no, html5-qrcode.
    ================================================================= */
 const FORMATOS = ['ean_13', 'ean_8', 'upc_a', 'upc_e', 'code_128', 'code_39', 'code_93', 'itf', 'codabar', 'qr_code'];
-let SCAN = { activo: false, stream: null, detector: null, timer: null, cb: null, continuo: false, ultimo: '', t: 0, h5: null };
+let SCAN = { activo: false, stream: null, detector: null, timer: null, cb: null, continuo: false, ultimo: '', t: 0, h5: null, contador: 0, historial: [] };
 
 async function abrirScanner(callback, continuo) {
   cerrarScanner();
-  SCAN.cb = callback; SCAN.continuo = !!continuo; SCAN.ultimo = ''; SCAN.t = 0;
+  desbloquearAudio();
+  SCAN.cb = callback; SCAN.continuo = !!continuo;
+  SCAN.ultimo = ''; SCAN.t = 0; SCAN.contador = 0; SCAN.historial = [];
 
   const d = document.createElement('div');
   d.className = 'modal-bg scan-bg';
   d.innerHTML =
     '<div class="modal scan-modal">'
-    + '<h3>Escanear código</h3>'
-    + '<div class="scan-box">'
+    + '<div class="scan-head"><h3>&#128247; Escanear código</h3>'
+    + '<span class="scan-cont" id="scanCont">' + (continuo ? '0 leídos' : '') + '</span></div>'
+    + '<div class="scan-box" id="scanBox">'
     + '  <video id="scanVideo" playsinline muted></video>'
     + '  <div id="scanFallback" class="scan-fallback" style="display:none"></div>'
     + '  <div class="scan-mira"><span></span></div>'
+    + '  <div class="scan-flash" id="scanFlash"></div>'
     + '</div>'
-    + '<div id="scanEstado" class="scan-estado">Iniciando cámara...</div>'
+    + '<div id="scanEstado" class="scan-estado">Iniciando cámara<span class="pts"></span></div>'
+    + '<div id="scanHist" class="scan-hist"></div>'
     + '<label class="lbl">O usa la pistola / escribe el código</label>'
     + '<input id="scanManual" class="inp" placeholder="Código + Enter" autocomplete="off" inputmode="numeric">'
-    + '<div id="scanMsg" class="msg"></div>'
-    + '<div class="modal-acts">'
-    + '  <button class="btn ghost" id="scanCambiar" style="display:none">Cambiar cámara</button>'
-    + '  <button class="btn ghost" id="scanCerrar">Cerrar</button>'
-    + '</div></div>';
+    + '<div class="modal-acts"><button class="btn ghost" id="scanCerrar">Cerrar</button></div>'
+    + '</div>';
   document.body.appendChild(d);
+  requestAnimationFrame(() => d.classList.add('entra'));
 
   $('scanCerrar').addEventListener('click', cerrarScanner);
   const mi = $('scanManual');
@@ -250,15 +427,12 @@ async function abrirScanner(callback, continuo) {
       if (v) entregarScan(v);
     }
   });
-  // En escritorio el foco va al campo (para la pistola USB); en movil no,
-  // para que no salte el teclado y tape la camara.
   if (!/Android|iPhone|iPad|iPod/i.test(navigator.userAgent)) mi.focus();
 
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     sinCamara('Este navegador no permite usar la cámara. Usa el campo de texto.');
     return;
   }
-
   try {
     SCAN.stream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } },
@@ -285,11 +459,10 @@ async function abrirScanner(callback, continuo) {
       if (!formatos.length) formatos = soportados;
     } catch (e) {}
     SCAN.detector = new window.BarcodeDetector({ formats: formatos });
-    $('scanEstado').textContent = 'Lector nativo activo — apunta al código';
+    $('scanEstado').innerHTML = '<span class="ok">Listo &mdash; apunta al código de barras</span>';
     bucleNativo(video);
   } else {
-    // Respaldo: html5-qrcode sobre el mismo contenedor
-    $('scanEstado').textContent = 'Lector de respaldo activo — apunta al código';
+    $('scanEstado').innerHTML = '<span class="ok">Listo &mdash; apunta al código de barras</span>';
     usarRespaldo();
   }
 }
@@ -306,24 +479,21 @@ function bucleNativo(video) {
         }
       }
     } catch (e) {}
-    if (SCAN.activo) SCAN.timer = setTimeout(tick, 120);
+    if (SCAN.activo) SCAN.timer = setTimeout(tick, 110);
   };
   tick();
 }
 
 function usarRespaldo() {
-  // Libera nuestro stream: html5-qrcode abre el suyo
   pararStream();
-  $('scanVideo').style.display = 'none';
-  const fb = $('scanFallback');
-  fb.style.display = 'block';
-  fb.id = 'scanFallback';
+  const v = $('scanVideo'); if (v) v.style.display = 'none';
+  const fb = $('scanFallback'); if (fb) fb.style.display = 'block';
   if (typeof Html5Qrcode === 'undefined') {
     sinCamara('No se pudo cargar el lector. Usa el campo de texto.');
     return;
   }
   try {
-    const cfg = { fps: 10, qrbox: { width: 240, height: 160 } };
+    const cfg = { fps: 10, qrbox: { width: 250, height: 160 } };
     if (typeof Html5QrcodeSupportedFormats !== 'undefined') {
       cfg.formatsToSupport = [
         Html5QrcodeSupportedFormats.EAN_13, Html5QrcodeSupportedFormats.EAN_8,
@@ -347,24 +517,51 @@ function sinCamara(mensaje) {
   SCAN.activo = false;
   const v = $('scanVideo'); if (v) v.style.display = 'none';
   const m = document.querySelector('.scan-mira'); if (m) m.style.display = 'none';
+  const b = $('scanBox'); if (b) b.classList.add('sin-camara');
   const e = $('scanEstado'); if (e) e.innerHTML = '<span class="err">' + esc(mensaje) + '</span>';
   const mi = $('scanManual'); if (mi) mi.focus();
+}
+
+/** Destello verde sobre la cámara: confirmacion visual de la lectura. */
+function destello() {
+  const f = $('scanFlash');
+  if (!f) return;
+  f.classList.remove('activo');
+  void f.offsetWidth;
+  f.classList.add('activo');
 }
 
 function entregarScan(texto) {
   const ahora = Date.now();
   if (texto === SCAN.ultimo && (ahora - SCAN.t) < 1800) return;
   SCAN.ultimo = texto; SCAN.t = ahora;
-  beep(); vibrar(45);
+
+  sonidoOk(); vibrar(50); destello();
+  SCAN.contador++;
+
+  const c = $('scanCont');
+  if (c && SCAN.continuo) c.textContent = SCAN.contador + (SCAN.contador === 1 ? ' leído' : ' leídos');
+
   const cb = SCAN.cb;
   if (SCAN.continuo) {
-    const sm = $('scanMsg');
-    if (sm) sm.innerHTML = '<span class="ok">Leído: ' + esc(texto) + '</span>';
     if (cb) cb(texto);
   } else {
     cerrarScanner();
     if (cb) cb(texto);
   }
+}
+
+/** Añade una linea al historial visible dentro del escáner. */
+function scanHistorial(texto, tipo) {
+  const h = $('scanHist');
+  if (!h) return;
+  SCAN.historial.unshift({ texto, tipo });
+  SCAN.historial = SCAN.historial.slice(0, 4);
+  h.innerHTML = SCAN.historial.map((x) =>
+    '<div class="sh-row ' + x.tipo + '">'
+    + '<span class="sh-ico">' + (x.tipo === 'ok' ? '&#10003;' : '&#9888;') + '</span>'
+    + esc(x.texto) + '</div>'
+  ).join('');
 }
 
 function pararStream() {
@@ -376,20 +573,31 @@ function cerrarScanner() {
   pararStream();
   if (SCAN.h5) { try { SCAN.h5.stop().then(() => { try { SCAN.h5.clear(); } catch (e) {} }).catch(() => {}); } catch (e) {} SCAN.h5 = null; }
   SCAN.detector = null; SCAN.cb = null; SCAN.continuo = false;
-  const d = document.querySelector('.scan-bg'); if (d) d.remove();
+  const d = document.querySelector('.scan-bg');
+  if (d) { d.classList.remove('entra'); setTimeout(() => d.remove(), 180); }
 }
 
 /* =================================================================
    DASHBOARD
    ================================================================= */
 function renderDashboard() {
-  if (!DATA.dashboard) { $('content').innerHTML = '<div class="placeholder"><h2>Dashboard</h2><p>Sin permiso para ver este módulo.</p></div>'; return; }
+  if (!DATA.dashboard) {
+    $('content').innerHTML = '<div class="placeholder"><h2>Dashboard</h2><p>Sin permiso para ver este módulo.</p></div>';
+    return;
+  }
   pintarDashboard(DATA.dashboard);
 }
 async function refrescarDashboard() {
-  $('content').innerHTML = esqueleto();
-  try { DATA.dashboard = await api('dashboard'); pintarDashboard(DATA.dashboard); }
-  catch (e) { $('content').innerHTML = '<div class="placeholder"><h2>Error</h2><p>' + esc(e.message) + '</p></div>'; }
+  const btn = $('btnRefDash');
+  if (btn) { btn.disabled = true; btn.innerHTML = '&#128260; Actualizando...'; }
+  try {
+    DATA.dashboard = await api('dashboard');
+    pintarDashboard(DATA.dashboard);
+    aviso('Datos actualizados', 'ok', 2000);
+  } catch (e) {
+    aviso(e.message, 'error');
+    if (btn) { btn.disabled = false; btn.innerHTML = '&#128260; Actualizar'; }
+  }
 }
 function pintarDashboard(d) {
   const kpis = kpi('&#128181;', 'Ventas de hoy', money(d.ventasDia), d.nDia + ' ventas')
@@ -400,7 +608,7 @@ function pintarDashboard(d) {
   const alertas = d.porVencer.length ? d.porVencer.map((v) => {
     const cls = v.estado === 'vencido' ? 'vencido' : 'alerta';
     const txt = v.estado === 'vencido' ? ('Vencido hace ' + Math.abs(v.dias) + ' d') : ('Vence en ' + v.dias + ' d');
-    return '<tr class="row-' + cls + '"><td>' + esc(v.producto) + '<div class="sub-sm">' + v.lote + ' · ' + v.vence + '</div></td>'
+    return '<tr class="row-' + cls + '"><td>' + esc(v.producto) + '<div class="sub-sm">' + v.lote + ' &middot; ' + v.vence + '</div></td>'
       + '<td class="hide-sm">' + v.lote + '</td><td class="tc">' + v.stock + '</td>'
       + '<td class="tc hide-sm">' + v.vence + '</td><td class="tc"><span class="tag ' + cls + '">' + txt + '</span></td></tr>';
   }).join('') : '<tr><td colspan="5" class="empty">Sin alertas</td></tr>';
@@ -432,7 +640,7 @@ function pintarDashboard(d) {
   const w = d.mensual.length * (bw + gap) + 10;
 
   $('content').innerHTML = '<div class="dash">'
-    + '<div class="dash-head"><button class="btn ghost" onclick="refrescarDashboard()">&#128260; Actualizar</button></div>'
+    + '<div class="dash-head"><button class="btn ghost" id="btnRefDash" onclick="refrescarDashboard()">&#128260; Actualizar</button></div>'
     + '<div class="kpi-grid">' + kpis + '</div>'
     + '<div class="grid-2">'
     + panel('&#9888; Próximos a vencer / vencidos', '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Producto</th><th class="hide-sm">Lote</th><th class="tc">Stock</th><th class="tc hide-sm">Vence</th><th class="tc">Estado</th></tr></thead><tbody>' + alertas + '</tbody></table></div>')
@@ -479,7 +687,6 @@ function renderVentas() {
     + '  <button class="btn btn-block" id="btnCobrar">&#128181; Cobrar</button>'
     + '</div></div>';
 
-  // Eventos (sin redibujar el input: NO pierde el foco)
   $('buscarProd').addEventListener('input', (e) => filtrarProd(e.target.value));
   $('cliBuscar').addEventListener('input', (e) => filtrarClientes(e.target.value));
   $('btnScanVenta').addEventListener('click', () => abrirScanner((t) => escaneoVenta(t), true));
@@ -492,33 +699,47 @@ function renderVentas() {
   if (!/Android|iPhone|iPad/i.test(navigator.userAgent)) si.focus();
 }
 function filtrarProd(q) {
-  q = (q || '').toLowerCase();
   const lista = DATA.catalogo.filter((p) =>
-    !q || p.nombre.toLowerCase().indexOf(q) >= 0 || (p.codigo && p.codigo.indexOf(q) >= 0)
+    !q || contiene(p.nombre, q) || (p.codigo && p.codigo.indexOf(q.trim()) >= 0)
   ).slice(0, 40);
   $('listaProd').innerHTML = lista.map((p) => {
     const sin = p.controla && p.stock <= 0;
     return '<div class="prod-card ' + (sin ? 'off' : '') + '" ' + (sin ? '' : 'onclick="agregar(\'' + p.id + '\')"') + '>'
       + '<div class="prod-nom">' + esc(p.nombre) + '</div>'
-      + '<div class="prod-meta">' + money(p.precio) + (p.controla ? (' · stock ' + p.stock) : '') + '</div></div>';
+      + '<div class="prod-meta">' + money(p.precio) + (p.controla ? (' &middot; stock ' + p.stock) : '') + '</div></div>';
   }).join('') || '<p class="empty">Sin coincidencias</p>';
+}
+/** Busca en memoria primero: instantaneo, sin viajar al servidor. */
+function buscarLocal(lista, texto) {
+  const t = String(texto || '').trim();
+  if (!t || !lista) return null;
+  return lista.filter((p) => p.codigo === t || String(p.id).toLowerCase() === t.toLowerCase())[0] || null;
 }
 function escaneoVenta(t) {
   t = String(t || '').trim();
   if (!t) return;
-  const local = DATA.catalogo.filter((p) => p.codigo === t || p.id === t)[0];
-  if (local) { agregarObj(local); return; }
+  const local = buscarLocal(DATA.catalogo, t);
+  if (local) {
+    agregarObj(local);
+    scanHistorial(local.nombre, 'ok');
+    return;
+  }
+  // No esta en memoria: preguntamos al servidor
+  scanHistorial('Buscando ' + t + '...', 'ok');
   api('buscarProducto', { texto: t })
-    .then((p) => agregarObj(p))
-    .catch((e) => flash(e.message));
+    .then((p) => { agregarObj(p); scanHistorial(p.nombre, 'ok'); })
+    .catch(() => {
+      sonidoError();
+      scanHistorial('No existe: ' + t, 'err');
+      aviso('No se encontró el producto con código ' + t, 'error');
+    });
 }
 function filtrarClientes(q) {
-  q = (q || '').toLowerCase();
   const drop = $('cliLista');
   if (!q) { drop.innerHTML = ''; drop.style.display = 'none'; $('cliId').value = ''; return; }
-  const lista = (DATA.clientes || []).filter((c) => c.nombre.toLowerCase().indexOf(q) >= 0).slice(0, 8);
+  const lista = (DATA.clientes || []).filter((c) => contiene(c.nombre, q)).slice(0, 8);
   drop.innerHTML = lista.map((c) =>
-    '<div class="cli-item" onclick="elegirCliente(\'' + c.id + '\',\'' + c.nombre.replace(/'/g, "\\'") + '\')">' + esc(c.nombre) + '</div>'
+    '<div class="cli-item" onclick="elegirCliente(\'' + c.id + '\',\'' + String(c.nombre).replace(/'/g, "\\'") + '\')">' + esc(c.nombre) + '</div>'
   ).join('') || '<div class="cli-item muted">Sin coincidencias</div>';
   drop.style.display = 'block';
 }
@@ -529,10 +750,18 @@ function agregar(id) { const p = DATA.catalogo.filter((x) => x.id === id)[0]; if
 function agregarObj(p) {
   const l = CARRITO.filter((x) => x.id === p.id)[0];
   if (l) {
-    if (p.controla && l.cantidad + 1 > p.stock) { flash('Sin stock suficiente de ' + p.nombre); return; }
+    if (p.controla && l.cantidad + 1 > p.stock) {
+      sonidoAviso();
+      aviso('Sin stock suficiente de ' + p.nombre + ' (máximo ' + p.stock + ')', 'error');
+      return;
+    }
     l.cantidad++;
   } else {
-    if (p.controla && p.stock <= 0) { flash('Sin stock de ' + p.nombre); return; }
+    if (p.controla && p.stock <= 0) {
+      sonidoAviso();
+      aviso('Sin stock de ' + p.nombre, 'error');
+      return;
+    }
     CARRITO.push({ id: p.id, nombre: p.nombre, precio: p.precio, cantidad: 1, controla: p.controla, stock: p.stock });
   }
   pintarCarrito();
@@ -541,13 +770,20 @@ function cambiarCant(id, d) {
   const l = CARRITO.filter((x) => x.id === id)[0]; if (!l) return;
   l.cantidad += d;
   if (l.cantidad <= 0) CARRITO = CARRITO.filter((x) => x.id !== id);
-  else if (l.controla && l.cantidad > l.stock) { l.cantidad = l.stock; flash('Máximo en stock: ' + l.stock); }
+  else if (l.controla && l.cantidad > l.stock) {
+    l.cantidad = l.stock;
+    aviso('Máximo en stock: ' + l.stock, 'error', 2400);
+  }
   pintarCarrito();
 }
 function quitar(id) { CARRITO = CARRITO.filter((x) => x.id !== id); pintarCarrito(); }
 function pintarCarrito() {
   const c = $('carrito'); if (!c) return;
-  if (!CARRITO.length) { c.innerHTML = '<p class="empty">Carrito vacío</p>'; $('totalTxt').textContent = money(0); return; }
+  if (!CARRITO.length) {
+    c.innerHTML = '<p class="empty">Carrito vacío</p>';
+    $('totalTxt').textContent = money(0);
+    return;
+  }
   let total = 0;
   c.innerHTML = CARRITO.map((l) => {
     const sub = l.precio * l.cantidad; total += sub;
@@ -558,30 +794,32 @@ function pintarCarrito() {
   }).join('');
   $('totalTxt').textContent = money(total);
 }
-function flash(t) {
-  const m = $('scanMsg') || $('ventaMsg');
-  if (m) { m.innerHTML = '<span class="err">' + esc(t) + '</span>'; setTimeout(() => { if (m) m.innerHTML = ''; }, 2600); }
-}
 async function cobrar() {
-  if (!CARRITO.length) { flash('El carrito está vacío.'); return; }
+  if (!CARRITO.length) { aviso('El carrito está vacío', 'error'); return; }
   cerrarScanner();
   const btn = $('btnCobrar'); btn.disabled = true;
-  const msg = $('ventaMsg'); msg.innerHTML = 'Procesando venta...';
+  const msg = $('ventaMsg'); msg.innerHTML = '<span class="cargando">Procesando venta<span class="pts"></span></span>';
   try {
     const r = await api('registrarVenta', {
       ID_Cliente: val('cliId'), Metodo_Pago: val('selPago'),
       items: CARRITO.map((l) => ({ id: l.id, cantidad: l.cantidad, precio: l.precio }))
     });
-    msg.innerHTML = '<span class="ok">Venta ' + r.idVenta + ' registrada.</span>';
+    msg.innerHTML = '';
+    sonidoOk();
+    aviso('Venta ' + r.idVenta + ' registrada — ' + money(r.total), 'ok', 3800);
     mostrarTicket(r.ticket);
     CARRITO = []; pintarCarrito();
     $('cliBuscar').value = ''; $('cliId').value = '';
-    // refrescar en segundo plano
-    api('catalogo').then((c) => { DATA.catalogo = c; const b = $('buscarProd'); filtrarProd(b ? b.value : ''); }).catch(() => {});
-    api('dashboard').then((d) => { DATA.dashboard = d; }).catch(() => {});
-    api('inventario').then((i) => { DATA.inventario = i; }).catch(() => {});
+    // El stock cambio: refrescamos en segundo plano
+    api('catalogo').then((c) => {
+      DATA.catalogo = c;
+      const b = $('buscarProd');
+      if (b) filtrarProd(b.value);
+    }).catch(() => {});
+    DATA.dashboard = null; DATA.inventario = null;
   } catch (e) {
     msg.innerHTML = '<span class="err">' + esc(e.message) + '</span>';
+    sonidoError();
   } finally { btn.disabled = false; }
 }
 
@@ -626,14 +864,14 @@ function imprimirTicket() {
 }
 
 /* =================================================================
-   INVENTARIO  (el buscador NO se redibuja: no pierde el foco)
+   INVENTARIO
    ================================================================= */
 function renderInventario() {
   if (!DATA.inventario) { $('content').innerHTML = '<div class="placeholder"><h2>Inventario</h2><p>Sin permiso.</p></div>'; return; }
   $('content').innerHTML = '<div class="card wide">'
     + '<div class="card-head"><h2>&#128230; Inventario</h2>'
     + '<div class="head-acts">'
-    + '  <button class="btn ghost" id="invRefresh">&#128260;</button>'
+    + '  <button class="btn ghost" id="invRefresh" title="Actualizar">&#128260;</button>'
     + '  <button class="btn ghost" id="invScan">&#128247; Escanear</button>'
     + '  <button class="btn" id="invNuevo">+ Producto</button>'
     + '</div></div>'
@@ -651,17 +889,17 @@ function renderInventario() {
   filasInventario('');
 }
 function filasInventario(q) {
-  q = (q || '').toLowerCase();
   const lista = DATA.inventario.filter((p) =>
     String(p.estado).toLowerCase() !== 'descontinuado' &&
-    (!q || p.nombre.toLowerCase().indexOf(q) >= 0 || (p.codigo && p.codigo.indexOf(q) >= 0))
+    (!q || contiene(p.nombre, q) || contiene(p.categoria, q) ||
+     contiene(p.marca, q) || (p.codigo && p.codigo.indexOf(String(q).trim()) >= 0))
   );
   $('invBody').innerHTML = lista.map((p) => {
     const bajo = p.stockMin > 0 && p.stock <= p.stockMin;
     const marg = (p.margen !== null && p.margen !== undefined) ? (p.margen + '%') : '-';
     return '<tr>'
       + '<td class="hide-sm">' + esc(p.codigo || '') + '</td>'
-      + '<td>' + esc(p.nombre) + '<div class="sub-sm">' + esc(p.categoria || '') + (p.costoUnit ? (' · costo ' + money(p.costoUnit)) : '') + '</div></td>'
+      + '<td>' + esc(p.nombre) + '<div class="sub-sm">' + esc(p.categoria || '') + (p.costoUnit ? (' &middot; costo ' + money(p.costoUnit)) : '') + '</div></td>'
       + '<td class="tc hide-sm">' + (p.costoUnit ? money(p.costoUnit) : '-') + '</td>'
       + '<td class="tc hide-sm">' + (p.costoCaja ? money(p.costoCaja) : '-') + '</td>'
       + '<td class="tc">' + money(p.precio) + '</td>'
@@ -669,22 +907,30 @@ function filasInventario(q) {
       + '<td class="tc ' + (bajo ? 'txt-warn' : '') + '">' + p.stock + '</td>'
       + '<td class="acts"><button class="mini" onclick=\'editarProducto(' + JSON.stringify(p).replace(/'/g, '&#39;') + ')\'>&#9998;</button>'
       + '<button class="mini danger" onclick="eliminarProducto(' + p._row + ')">&#128465;</button></td></tr>';
-  }).join('') || '<tr><td colspan="8" class="empty">Sin productos</td></tr>';
+  }).join('') || '<tr><td colspan="8" class="empty">Sin coincidencias</td></tr>';
 }
 async function refrescarInventario() {
+  const btn = $('invRefresh');
+  if (btn) btn.disabled = true;
   try {
     DATA.inventario = await api('inventario');
     const b = $('invBuscar');
     filasInventario(b ? b.value : '');
-  } catch (e) { alert(e.message); }
+    aviso('Inventario actualizado', 'ok', 2000);
+  } catch (e) { aviso(e.message, 'error'); }
+  finally { if (btn) btn.disabled = false; }
 }
+/** Escaneo en inventario: busca primero en memoria (instantaneo). */
 function scanInventario() {
-  abrirScanner((t) => {
-    api('buscarInventario', { texto: t }).then((r) => {
-      if (r.encontrado) editarProducto(r.producto);
-      else if (confirm('No existe un producto con el código ' + r.codigo + '.\n\n¿Crear uno nuevo con ese código?'))
-        editarProducto(null, r.codigo);
-    }).catch((e) => alert(e.message));
+  abrirScanner(async (t) => {
+    const local = buscarLocal(DATA.inventario, t);
+    if (local) { editarProducto(local); return; }
+    const ok = await preguntar({
+      titulo: 'Producto no registrado',
+      texto: 'No existe ningún producto con el código ' + t + '. ¿Quieres crearlo ahora con ese código?',
+      aceptar: 'Crear producto', cancelar: 'Cancelar', icono: '&#128230;'
+    });
+    if (ok) editarProducto(null, t);
   }, false);
 }
 function editarProducto(p, codigoPre) {
@@ -717,7 +963,10 @@ function editarProducto(p, codigoPre) {
     + '<div class="modal-acts"><button class="btn ghost" onclick="cerrarModal()">Cancelar</button>'
     + '<button class="btn" id="pGuardar">Guardar</button></div></div>');
 
-  $('pScan').addEventListener('click', () => abrirScanner((t) => { $('pCod').value = String(t).trim(); }, false));
+  $('pScan').addEventListener('click', () => abrirScanner((t) => {
+    $('pCod').value = String(t).trim();
+    aviso('Código capturado: ' + String(t).trim(), 'ok', 2400);
+  }, false));
   $('pVenc').addEventListener('change', (e) => { $('pDiasWrap').style.display = e.target.checked ? 'block' : 'none'; });
   $('pCostoU').addEventListener('input', calcMargen);
   $('pPre').addEventListener('input', calcMargen);
@@ -730,11 +979,13 @@ function calcMargen() {
   if (c > 0 && v > 0) {
     const g = v - c, m = Math.round((g / v) * 100);
     const cls = m < 15 ? 'err' : (m < 30 ? '' : 'ok');
-    box.innerHTML = 'Ganancia por unidad: <b>' + money(g) + '</b> · Margen: <span class="' + cls + '"><b>' + m + '%</b></span>';
+    box.innerHTML = 'Ganancia por unidad: <b>' + money(g) + '</b> &middot; Margen: <span class="' + cls + '"><b>' + m + '%</b></span>';
   } else box.innerHTML = '<span class="muted">Ingresa costo y precio para ver el margen.</span>';
 }
 async function salvarProducto(row) {
-  const msg = $('pMsg'); msg.innerHTML = 'Guardando...';
+  const msg = $('pMsg');
+  const btn = $('pGuardar'); btn.disabled = true;
+  msg.innerHTML = '<span class="cargando">Guardando<span class="pts"></span></span>';
   try {
     await api('guardarProducto', {
       _row: row || null, nombre: val('pNom'), codigo: val('pCod'), idCategoria: val('pCat'),
@@ -743,14 +994,29 @@ async function salvarProducto(row) {
       controla: $('pVenc').checked, diasAlerta: val('pDias')
     });
     cerrarModal();
+    aviso(row ? 'Producto actualizado' : 'Producto creado', 'ok');
+    DATA.catalogo = null; DATA.dashboard = null;
     await refrescarInventario();
-    api('catalogo').then((c) => { DATA.catalogo = c; }).catch(() => {});
-  } catch (e) { msg.innerHTML = '<span class="err">' + esc(e.message) + '</span>'; }
+  } catch (e) {
+    msg.innerHTML = '<span class="err">' + esc(e.message) + '</span>';
+    btn.disabled = false;
+    sonidoError();
+  }
 }
 async function eliminarProducto(row) {
-  if (!confirm('¿Descontinuar este producto? Dejará de aparecer en ventas.')) return;
-  try { await api('eliminarProducto', { row }); await refrescarInventario(); }
-  catch (e) { alert(e.message); }
+  const prod = DATA.inventario.filter((p) => p._row === row)[0];
+  const ok = await preguntar({
+    titulo: 'Descontinuar producto',
+    texto: (prod ? '"' + prod.nombre + '" ' : 'El producto ') + 'dejará de aparecer en ventas, pero su historial se conserva.',
+    aceptar: 'Descontinuar', cancelar: 'Cancelar', peligro: true, icono: '&#128465;'
+  });
+  if (!ok) return;
+  try {
+    await api('eliminarProducto', { row });
+    aviso('Producto descontinuado', 'ok');
+    DATA.catalogo = null; DATA.dashboard = null;
+    await refrescarInventario();
+  } catch (e) { aviso(e.message, 'error'); }
 }
 
 /* =================================================================
@@ -781,9 +1047,9 @@ function renderCompras() {
   filasCompraProd(''); pintarCompra();
 }
 function filasCompraProd(q) {
-  q = (q || '').toLowerCase();
   const lista = (DATA.inventario || []).filter((p) =>
-    String(p.estado).toLowerCase() !== 'descontinuado' && (!q || p.nombre.toLowerCase().indexOf(q) >= 0)
+    String(p.estado).toLowerCase() !== 'descontinuado' &&
+    (!q || contiene(p.nombre, q) || contiene(p.marca, q))
   ).slice(0, 24);
   $('compLista').innerHTML = lista.map((p) =>
     '<div class="prod-card" onclick=\'addCompra(' + JSON.stringify({ id: p.id, nombre: p.nombre, controla: p.controla, costo: p.costoUnit }).replace(/'/g, '&#39;') + ')\'>'
@@ -793,14 +1059,23 @@ function filasCompraProd(q) {
 }
 function scanCompra() {
   abrirScanner((t) => {
-    api('buscarInventario', { texto: t }).then((r) => {
-      if (r.encontrado) addCompra({ id: r.producto.id, nombre: r.producto.nombre, controla: r.producto.controla, costo: r.producto.costoUnit });
-      else alert('No existe un producto con el código ' + r.codigo + '. Regístralo primero en Inventario.');
-    }).catch((e) => alert(e.message));
+    const local = buscarLocal(DATA.inventario, t);
+    if (local) {
+      addCompra({ id: local.id, nombre: local.nombre, controla: local.controla, costo: local.costoUnit });
+      scanHistorial(local.nombre, 'ok');
+    } else {
+      sonidoError();
+      scanHistorial('No existe: ' + t, 'err');
+      aviso('No existe un producto con el código ' + t + '. Regístralo primero en Inventario.', 'error', 4200);
+    }
   }, true);
 }
 function addCompra(p) {
-  if (COMPRA.filter((x) => x.id === p.id).length) return;
+  if (COMPRA.filter((x) => x.id === p.id).length) {
+    sonidoAviso();
+    aviso(p.nombre + ' ya está en la lista', 'info', 2200);
+    return;
+  }
   COMPRA.push({ id: p.id, nombre: p.nombre, controla: p.controla, cantidad: 1, costo: p.costo || 0, vence: '' });
   pintarCompra();
 }
@@ -829,34 +1104,36 @@ function setCompra(i, campo, valor) {
 function quitarCompra(i) { COMPRA.splice(i, 1); pintarCompra(); }
 async function registrarCompra() {
   const prov = val('compProv'), msg = $('compMsg');
-  if (!prov) { msg.innerHTML = '<span class="err">Selecciona un proveedor.</span>'; return; }
-  if (!COMPRA.length) { msg.innerHTML = '<span class="err">Agrega productos.</span>'; return; }
+  if (!prov) { aviso('Selecciona un proveedor', 'error'); return; }
+  if (!COMPRA.length) { aviso('Agrega al menos un producto', 'error'); return; }
   const fv = COMPRA.filter((l) => l.controla && !l.vence)[0];
-  if (fv) { msg.innerHTML = '<span class="err">Falta fecha de vencimiento en: ' + esc(fv.nombre) + '</span>'; return; }
+  if (fv) { aviso('Falta la fecha de vencimiento de ' + fv.nombre, 'error', 4000); return; }
   const fc = COMPRA.filter((l) => !l.costo || l.costo <= 0)[0];
-  if (fc) { msg.innerHTML = '<span class="err">Falta costo en: ' + esc(fc.nombre) + '</span>'; return; }
+  if (fc) { aviso('Falta el costo de ' + fc.nombre, 'error', 4000); return; }
   cerrarScanner();
   const btn = $('btnCompra'); btn.disabled = true;
-  msg.innerHTML = 'Registrando...';
+  msg.innerHTML = '<span class="cargando">Registrando<span class="pts"></span></span>';
   try {
     const r = await api('registrarCompra', {
       idProveedor: prov,
       items: COMPRA.map((l) => ({ id: l.id, cantidad: l.cantidad, costo: l.costo, vence: l.vence }))
     });
-    msg.innerHTML = '<span class="ok">Compra ' + r.idCompra + ' registrada. ' + r.lotesNuevos + ' lote(s) creados.</span>';
+    msg.innerHTML = '';
+    sonidoOk();
+    aviso('Compra ' + r.idCompra + ' registrada — ' + money(r.total), 'ok', 3800);
     COMPRA = []; pintarCompra();
-    api('inventario').then((i) => { DATA.inventario = i; }).catch(() => {});
-    api('catalogo').then((c) => { DATA.catalogo = c; }).catch(() => {});
-    api('dashboard').then((d) => { DATA.dashboard = d; }).catch(() => {});
-  } catch (e) { msg.innerHTML = '<span class="err">' + esc(e.message) + '</span>'; }
-  finally { btn.disabled = false; }
+    DATA.inventario = null; DATA.catalogo = null; DATA.dashboard = null;
+  } catch (e) {
+    msg.innerHTML = '<span class="err">' + esc(e.message) + '</span>';
+    sonidoError();
+  } finally { btn.disabled = false; }
 }
 
 /* =================================================================
    CLIENTES / PROVEEDORES
    ================================================================= */
 function renderClientes() {
-  const sub = DATA.proveedores ? '<button class="tab" data-t="prov">&#128666; Proveedores</button>' : '';
+  const sub = (SESION.permisos || {}).Proveedores ? '<button class="tab" data-t="prov">&#128666; Proveedores</button>' : '';
   $('content').innerHTML = '<div class="tabs"><button class="tab active" data-t="cli">&#128101; Clientes</button>' + sub + '</div><div id="cliBody"></div>';
   document.querySelectorAll('.tabs .tab').forEach((b) => b.addEventListener('click', () => {
     document.querySelectorAll('.tabs .tab').forEach((x) => x.classList.remove('active'));
@@ -874,17 +1151,16 @@ function tabClientes() {
   $('cliFiltro').addEventListener('input', (e) => filasClientes(e.target.value));
   $('cliNuevo').addEventListener('click', () => editarCliente(null));
   filasClientes('');
-  if (!DATA.clientes) api('clientes').then((l) => { DATA.clientes = l; filasClientes(val('cliFiltro')); }).catch(() => {});
 }
 function filasClientes(q) {
-  q = (q || '').toLowerCase();
-  const lista = (DATA.clientes || []).filter((c) => !q || c.nombre.toLowerCase().indexOf(q) >= 0);
+  const lista = (DATA.clientes || []).filter((c) =>
+    !q || contiene(c.nombre, q) || contiene(c.telefono, q) || contiene(c.correo, q));
   const b = $('cliBodyTbl'); if (!b) return;
   b.innerHTML = lista.map((c) =>
     '<tr><td class="hide-sm">' + c.id + '</td><td>' + esc(c.nombre) + '<div class="sub-sm">' + esc(c.telefono || '') + '</div></td>'
     + '<td class="hide-sm">' + esc(c.correo || '') + '</td><td class="hide-sm">' + esc(c.tipo || '') + '</td>'
     + '<td class="acts"><button class="mini" onclick=\'editarCliente(' + JSON.stringify(c).replace(/'/g, '&#39;') + ')\'>&#9998;</button></td></tr>'
-  ).join('') || '<tr><td colspan="5" class="empty">Sin clientes</td></tr>';
+  ).join('') || '<tr><td colspan="5" class="empty">Sin coincidencias</td></tr>';
 }
 function editarCliente(c) {
   abrirModal('<div class="modal"><h3>' + (c ? 'Editar cliente' : 'Nuevo cliente') + '</h3>'
@@ -899,15 +1175,28 @@ function editarCliente(c) {
   $('cGuardar').addEventListener('click', () => salvarCliente(c ? c._row : null));
 }
 async function salvarCliente(row) {
-  const msg = $('cMsg'); msg.innerHTML = 'Guardando...';
+  const msg = $('cMsg'), btn = $('cGuardar');
+  btn.disabled = true;
+  msg.innerHTML = '<span class="cargando">Guardando<span class="pts"></span></span>';
   try {
     await api('guardarCliente', { _row: row || null, nombre: val('cNom'), telefono: val('cTel'), correo: val('cCor'), direccion: val('cDir'), tipo: val('cTipo') });
     cerrarModal();
+    aviso(row ? 'Cliente actualizado' : 'Cliente creado', 'ok');
     DATA.clientes = await api('clientes');
-    filasClientes(val('cliFiltro'));
-  } catch (e) { msg.innerHTML = '<span class="err">' + esc(e.message) + '</span>'; }
+    const f = $('cliFiltro');
+    filasClientes(f ? f.value : '');
+  } catch (e) {
+    msg.innerHTML = '<span class="err">' + esc(e.message) + '</span>';
+    btn.disabled = false;
+    sonidoError();
+  }
 }
-function tabProveedores() {
+async function tabProveedores() {
+  $('cliBody').innerHTML = '<div class="skel-panel alto"></div>';
+  if (!DATA.proveedores) {
+    try { DATA.proveedores = await api('proveedores'); }
+    catch (e) { $('cliBody').innerHTML = pantallaError(e.message, 'clientes'); return; }
+  }
   $('cliBody').innerHTML = '<div class="card wide">'
     + '<div class="card-head"><h2>&#128666; Proveedores</h2><button class="btn" id="prNuevo">+ Proveedor</button></div>'
     + '<input class="inp" id="prFiltro" placeholder="Buscar proveedor..." autocomplete="off" style="margin-bottom:14px">'
@@ -918,15 +1207,15 @@ function tabProveedores() {
   filasProv('');
 }
 function filasProv(q) {
-  q = (q || '').toLowerCase();
-  const lista = (DATA.proveedores || []).filter((p) => !q || p.nombre.toLowerCase().indexOf(q) >= 0);
+  const lista = (DATA.proveedores || []).filter((p) =>
+    !q || contiene(p.nombre, q) || contiene(p.tipo, q) || contiene(p.telefono, q));
   const b = $('prBodyTbl'); if (!b) return;
   b.innerHTML = lista.map((p) =>
     '<tr><td class="hide-sm">' + p.id + '</td><td>' + esc(p.nombre) + '<div class="sub-sm">' + esc(p.telefono || '') + '</div></td>'
     + '<td class="hide-sm">' + esc(p.correo || '') + '</td><td class="hide-sm">' + esc(p.tipo || '') + '</td>'
     + '<td class="acts"><button class="mini" onclick=\'editarProveedor(' + JSON.stringify(p).replace(/'/g, '&#39;') + ')\'>&#9998;</button>'
     + '<button class="mini danger" onclick="eliminarProveedor(' + p._row + ')">&#128465;</button></td></tr>'
-  ).join('') || '<tr><td colspan="5" class="empty">Sin proveedores</td></tr>';
+  ).join('') || '<tr><td colspan="5" class="empty">Sin coincidencias</td></tr>';
 }
 function editarProveedor(p) {
   abrirModal('<div class="modal"><h3>' + (p ? 'Editar proveedor' : 'Nuevo proveedor') + '</h3>'
@@ -940,18 +1229,37 @@ function editarProveedor(p) {
   $('prGuardar').addEventListener('click', () => salvarProveedor(p ? p._row : null));
 }
 async function salvarProveedor(row) {
-  const msg = $('prMsg'); msg.innerHTML = 'Guardando...';
+  const msg = $('prMsg'), btn = $('prGuardar');
+  btn.disabled = true;
+  msg.innerHTML = '<span class="cargando">Guardando<span class="pts"></span></span>';
   try {
     await api('guardarProveedor', { _row: row || null, nombre: val('prNom'), telefono: val('prTel'), correo: val('prCor'), tipo: val('prTipo'), direccion: val('prDir') });
     cerrarModal();
+    aviso(row ? 'Proveedor actualizado' : 'Proveedor creado', 'ok');
     DATA.proveedores = await api('proveedores');
-    filasProv(val('prFiltro'));
-  } catch (e) { msg.innerHTML = '<span class="err">' + esc(e.message) + '</span>'; }
+    const f = $('prFiltro');
+    filasProv(f ? f.value : '');
+  } catch (e) {
+    msg.innerHTML = '<span class="err">' + esc(e.message) + '</span>';
+    btn.disabled = false;
+    sonidoError();
+  }
 }
 async function eliminarProveedor(row) {
-  if (!confirm('¿Desactivar este proveedor?')) return;
-  try { await api('eliminarProveedor', { row }); DATA.proveedores = await api('proveedores'); filasProv(val('prFiltro')); }
-  catch (e) { alert(e.message); }
+  const pr = (DATA.proveedores || []).filter((p) => p._row === row)[0];
+  const ok = await preguntar({
+    titulo: 'Desactivar proveedor',
+    texto: (pr ? '"' + pr.nombre + '" ' : 'El proveedor ') + 'dejará de aparecer al registrar compras.',
+    aceptar: 'Desactivar', cancelar: 'Cancelar', peligro: true, icono: '&#128465;'
+  });
+  if (!ok) return;
+  try {
+    await api('eliminarProveedor', { row });
+    aviso('Proveedor desactivado', 'ok');
+    DATA.proveedores = await api('proveedores');
+    const f = $('prFiltro');
+    filasProv(f ? f.value : '');
+  } catch (e) { aviso(e.message, 'error'); }
 }
 
 /* =================================================================
@@ -990,15 +1298,17 @@ function tabPerso() {
 }
 function descargarLogo() {
   const m = DATA.marca;
-  if (!m || !m.logo) { alert('No hay logo guardado.'); return; }
+  if (!m || !m.logo) { aviso('No hay logo guardado', 'error'); return; }
   const ext = m.logo.indexOf('image/png') >= 0 ? 'png' : 'jpg';
   const a = document.createElement('a');
   a.href = m.logo; a.download = 'logo-licoreria.' + ext;
   document.body.appendChild(a); a.click(); a.remove();
+  aviso('Logo descargado', 'ok');
 }
 function comprimirLogo(ev) {
   const file = ev.target.files[0]; if (!file) return;
-  const msg = $('admMsg'); msg.innerHTML = 'Procesando imagen...';
+  const msg = $('admMsg');
+  msg.innerHTML = '<span class="cargando">Procesando imagen<span class="pts"></span></span>';
   const reader = new FileReader();
   reader.onload = (e) => {
     const img = new Image();
@@ -1011,14 +1321,16 @@ function comprimirLogo(ev) {
       while (out.length > 46000 && q > 0.3) { q -= 0.1; out = c.toDataURL('image/jpeg', q); }
       window._logoBase64 = out;
       $('logoPreview').outerHTML = '<img src="' + out + '" id="logoPreview" class="logo-preview">';
-      msg.innerHTML = '<span class="ok">Imagen lista (' + Math.round(out.length / 1024) + ' KB).</span>';
+      msg.innerHTML = '<span class="ok">Imagen lista (' + Math.round(out.length / 1024) + ' KB). Pulsa Guardar.</span>';
     };
     img.src = e.target.result;
   };
   reader.readAsDataURL(file);
 }
 async function guardarMarca() {
-  const msg = $('admMsg'); msg.innerHTML = 'Guardando...';
+  const msg = $('admMsg'), btn = $('btnGuardarMarca');
+  btn.disabled = true;
+  msg.innerHTML = '<span class="cargando">Guardando<span class="pts"></span></span>';
   try {
     const payload = { nombre: val('inpNombre') };
     if (window._logoBase64) payload.logo = window._logoBase64;
@@ -1027,8 +1339,12 @@ async function guardarMarca() {
     DATA.marca = m;
     localStorage.setItem('pos_marca', JSON.stringify(m));
     aplicarMarcaHeader(m);
-    msg.innerHTML = '<span class="ok">Guardado.</span>';
-  } catch (e) { msg.innerHTML = '<span class="err">' + esc(e.message) + '</span>'; }
+    msg.innerHTML = '';
+    aviso('Personalización guardada', 'ok');
+  } catch (e) {
+    msg.innerHTML = '<span class="err">' + esc(e.message) + '</span>';
+    sonidoError();
+  } finally { btn.disabled = false; }
 }
 function tabNegocio() {
   const n = DATA.negocio || {};
@@ -1043,33 +1359,45 @@ function tabNegocio() {
   $('btnGuardarNeg').addEventListener('click', guardarNegocio);
 }
 async function guardarNegocio() {
-  const msg = $('negMsg'); msg.innerHTML = 'Guardando...';
+  const msg = $('negMsg'), btn = $('btnGuardarNeg');
+  btn.disabled = true;
+  msg.innerHTML = '<span class="cargando">Guardando<span class="pts"></span></span>';
   try {
     const n = await api('guardarNegocio', { nombre: val('nNom'), ruc: val('nRuc'), direccion: val('nDir'), telefono: val('nTel'), mensaje: val('nMsg') });
     DATA.negocio = n;
     localStorage.setItem('pos_negocio', JSON.stringify(n));
     if (n.nombre && DATA.marca) { DATA.marca.nombre = n.nombre; aplicarMarcaHeader(DATA.marca); }
-    msg.innerHTML = '<span class="ok">Datos guardados.</span>';
-  } catch (e) { msg.innerHTML = '<span class="err">' + esc(e.message) + '</span>'; }
+    msg.innerHTML = '';
+    aviso('Datos del negocio guardados', 'ok');
+  } catch (e) {
+    msg.innerHTML = '<span class="err">' + esc(e.message) + '</span>';
+    sonidoError();
+  } finally { btn.disabled = false; }
 }
+
+/** Usuarios y roles en UNA sola peticion (antes eran dos). */
 async function tabUsuarios() {
-  $('admBody').innerHTML = '<p class="loading">Cargando...</p>';
+  $('admBody').innerHTML = '<div class="skel-panel alto"></div>';
   try {
-    const lista = await api('usuarios');
-    if (!DATA.roles) DATA.roles = await api('roles');
-    window._roles = DATA.roles.map((r) => r.Rol);
+    const d = await api('usuariosYRoles');
+    DATA.roles = d.roles;
+    window._roles = d.roles.map((r) => r.Rol);
     $('admBody').innerHTML = '<div class="card wide"><div class="card-head"><h2>&#128100; Usuarios</h2>'
       + '<button class="btn" id="uNuevo">+ Usuario</button></div>'
       + '<div class="tbl-wrap"><table class="tbl"><thead><tr><th class="hide-sm">ID</th><th>Nombre</th><th>Rol</th>'
       + '<th class="tc">Estado</th><th></th></tr></thead><tbody>'
-      + lista.map((u) =>
+      + d.usuarios.map((u) =>
         '<tr><td class="hide-sm">' + u.ID_Usuario + '</td><td>' + esc(u.Nombre) + '<div class="sub-sm">' + esc(u.Email || '') + '</div></td>'
         + '<td>' + esc(u.Rol) + '</td><td class="tc"><span class="badge ' + (String(u.Estado).toLowerCase() === 'activo' ? 'on' : 'off') + '">' + u.Estado + '</span></td>'
         + '<td class="acts"><button class="mini" onclick=\'editarUsuario(' + JSON.stringify(u).replace(/'/g, '&#39;') + ')\'>&#9998;</button>'
         + '<button class="mini danger" onclick="eliminarUsuario(' + u._row + ')">&#128465;</button></td></tr>'
       ).join('') + '</tbody></table></div></div>';
     $('uNuevo').addEventListener('click', () => editarUsuario(null));
-  } catch (e) { $('admBody').innerHTML = '<div class="placeholder"><p>' + esc(e.message) + '</p></div>'; }
+  } catch (e) {
+    $('admBody').innerHTML = '<div class="placeholder"><div class="ph-ico">&#9888;</div>'
+      + '<h2>No se pudo cargar</h2><p>' + esc(e.message) + '</p>'
+      + '<button class="btn" onclick="tabUsuarios()">&#128260; Reintentar</button></div>';
+  }
 }
 function editarUsuario(u) {
   const esNuevo = !u;
@@ -1080,27 +1408,46 @@ function editarUsuario(u) {
     + '<label class="lbl">Email</label><input id="mEmail" class="inp" value="' + esc(u && u.Email ? u.Email : '') + '">'
     + '<label class="lbl">Rol</label><select id="mRol" class="inp">' + ops + '</select>'
     + (esNuevo ? '' : '<label class="lbl">Estado</label><select id="mEstado" class="inp"><option' + (u.Estado === 'Activo' ? ' selected' : '') + '>Activo</option><option' + (u.Estado === 'Inactivo' ? ' selected' : '') + '>Inactivo</option></select>')
-    + '<label class="lbl">PIN ' + (esNuevo ? '' : '(vacío = no cambiar)') + '</label><input id="mPin" class="inp" type="password" inputmode="numeric" placeholder="••••">'
+    + '<label class="lbl">PIN ' + (esNuevo ? '' : '(vacío = no cambiar)') + '</label><input id="mPin" class="inp" type="password" inputmode="numeric" placeholder="&bull;&bull;&bull;&bull;">'
+    + '<p class="muted" style="margin-top:6px">Usa al menos 6 dígitos y evita secuencias como 123456.</p>'
     + '<div id="mMsg" class="msg"></div><div class="modal-acts"><button class="btn ghost" onclick="cerrarModal()">Cancelar</button>'
     + '<button class="btn" id="uGuardar">Guardar</button></div></div>');
   $('uGuardar').addEventListener('click', () => salvarUsuario(u ? u._row : null));
 }
 async function salvarUsuario(row) {
-  const msg = $('mMsg'); msg.innerHTML = 'Guardando...';
+  const msg = $('mMsg'), btn = $('uGuardar');
+  btn.disabled = true;
+  msg.innerHTML = '<span class="cargando">Guardando<span class="pts"></span></span>';
   try {
     const d = { _row: row || null, Nombre: val('mNombre'), Email: val('mEmail'), Rol: val('mRol'), PIN: val('mPin') };
     if ($('mEstado')) d.Estado = val('mEstado');
     await api('guardarUsuario', d);
-    cerrarModal(); tabUsuarios();
-  } catch (e) { msg.innerHTML = '<span class="err">' + esc(e.message) + '</span>'; }
+    cerrarModal();
+    aviso(row ? 'Usuario actualizado' : 'Usuario creado', 'ok');
+    tabUsuarios();
+  } catch (e) {
+    msg.innerHTML = '<span class="err">' + esc(e.message) + '</span>';
+    btn.disabled = false;
+    sonidoError();
+  }
 }
 async function eliminarUsuario(row) {
-  if (!confirm('¿Eliminar este usuario?')) return;
-  try { await api('eliminarUsuario', { row }); tabUsuarios(); } catch (e) { alert(e.message); }
+  const ok = await preguntar({
+    titulo: 'Eliminar usuario',
+    texto: 'Esta acción no se puede deshacer. El usuario ya no podrá iniciar sesión.',
+    aceptar: 'Eliminar', cancelar: 'Cancelar', peligro: true, icono: '&#128465;'
+  });
+  if (!ok) return;
+  try {
+    await api('eliminarUsuario', { row });
+    aviso('Usuario eliminado', 'ok');
+    tabUsuarios();
+  } catch (e) { aviso(e.message, 'error', 4200); }
 }
+
 const PERM = ['Ventas', 'Inventario', 'Compras', 'Clientes', 'Proveedores', 'Dashboard', 'Admin_Usuarios'];
 async function tabRoles() {
-  $('admBody').innerHTML = '<p class="loading">Cargando...</p>';
+  $('admBody').innerHTML = '<div class="skel-panel alto"></div>';
   try {
     DATA.roles = await api('roles');
     $('admBody').innerHTML = '<div class="card wide"><div class="card-head"><h2>&#128273; Roles</h2>'
@@ -1114,7 +1461,11 @@ async function tabRoles() {
           + '<button class="mini danger" onclick="eliminarRol(' + r._row + ')">&#128465;</button></td></tr>';
       }).join('') + '</tbody></table></div></div>';
     $('rNuevo').addEventListener('click', () => editarRol(null));
-  } catch (e) { $('admBody').innerHTML = '<div class="placeholder"><p>' + esc(e.message) + '</p></div>'; }
+  } catch (e) {
+    $('admBody').innerHTML = '<div class="placeholder"><div class="ph-ico">&#9888;</div>'
+      + '<h2>No se pudo cargar</h2><p>' + esc(e.message) + '</p>'
+      + '<button class="btn" onclick="tabRoles()">&#128260; Reintentar</button></div>';
+  }
 }
 function editarRol(r) {
   const esNuevo = !r;
@@ -1132,15 +1483,33 @@ function editarRol(r) {
   $('rGuardar').addEventListener('click', () => salvarRol(r ? r._row : null));
 }
 async function salvarRol(row) {
-  const msg = $('rMsg'); msg.innerHTML = 'Guardando...';
+  const msg = $('rMsg'), btn = $('rGuardar');
+  btn.disabled = true;
+  msg.innerHTML = '<span class="cargando">Guardando<span class="pts"></span></span>';
   try {
     const d = { _row: row || null, Rol: val('rNombre'), Descripcion: val('rDesc') };
     PERM.forEach((p) => { d[p] = $('chk_' + p).checked; });
     await api('guardarRol', d);
-    cerrarModal(); tabRoles();
-  } catch (e) { msg.innerHTML = '<span class="err">' + esc(e.message) + '</span>'; }
+    cerrarModal();
+    aviso(row ? 'Rol actualizado' : 'Rol creado', 'ok');
+    tabRoles();
+  } catch (e) {
+    msg.innerHTML = '<span class="err">' + esc(e.message) + '</span>';
+    btn.disabled = false;
+    sonidoError();
+  }
 }
 async function eliminarRol(row) {
-  if (!confirm('¿Eliminar este rol?')) return;
-  try { await api('eliminarRol', { row }); tabRoles(); } catch (e) { alert(e.message); }
+  const rol = (DATA.roles || []).filter((r) => r._row === row)[0];
+  const ok = await preguntar({
+    titulo: 'Eliminar rol',
+    texto: (rol ? 'El rol "' + rol.Rol + '" ' : 'Este rol ') + 'se eliminará. Solo es posible si ningún usuario lo tiene asignado.',
+    aceptar: 'Eliminar', cancelar: 'Cancelar', peligro: true, icono: '&#128465;'
+  });
+  if (!ok) return;
+  try {
+    await api('eliminarRol', { row });
+    aviso('Rol eliminado', 'ok');
+    tabRoles();
+  } catch (e) { aviso(e.message, 'error', 4600); }
 }
