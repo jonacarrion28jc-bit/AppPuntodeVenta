@@ -17,10 +17,10 @@ let VISTA_PENDIENTE = null;
 /* ============ LLAMADAS A LA API ============ */
 async function api(action, data) {
   const res = await fetch(API_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-    body: JSON.stringify({ action, token: TOKEN, data: data || {} })
-  });
+  method: 'POST',
+  body: JSON.stringify({ action, token: TOKEN, data: data || {} }),
+  redirect: 'follow'
+});
   if (!res.ok) throw new Error('Sin conexión con el servidor (' + res.status + ')');
   const j = await res.json();
   if (!j.ok) {
