@@ -1,6 +1,6 @@
 /* Service worker: cachea la interfaz para que abra al instante.
    Los DATOS nunca se cachean: siempre vienen frescos de la API. */
-const CACHE = 'pos-vitys-v2';
+const CACHE = 'pos-vitys-v3';
 const ARCHIVOS = [
   './',
   './index.html',

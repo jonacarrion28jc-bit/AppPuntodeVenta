@@ -277,6 +277,7 @@ async function cerrarSesion(silencioso) {
   TOKEN = null; SESION = null;
   DATA = { marca: DATA.marca, negocio: DATA.negocio };
   VISTA_ACTUAL = null;
+  VISTA_HTML = {}; VISTA_SCROLL = {};
   localStorage.removeItem('pos_token');
   localStorage.removeItem('pos_sesion');
   cerrarScanner();
@@ -332,9 +333,30 @@ const NECESITA = {
   admin:      { claves: [], accion: null }
 };
 
+/* Vistas cuyo HTML se conserva tal cual entre cambios de pestaña.
+   Ventas y Compras NO se guardan: siempre empiezan con carrito limpio.
+   Admin tampoco: sus sub-pestañas se manejan aparte. */
+const VISTAS_VIVAS = { dashboard: true, clientes: true };
+let VISTA_HTML = {};   // html guardado de cada vista viva
+let VISTA_SCROLL = {}; // posicion de scroll guardada
+
 async function abrirVista(v) {
+  // Guardar el estado de la vista que dejamos, si es "viva"
+  if (VISTA_ACTUAL && VISTAS_VIVAS[VISTA_ACTUAL]) {
+    VISTA_HTML[VISTA_ACTUAL] = $('content').innerHTML;
+    VISTA_SCROLL[VISTA_ACTUAL] = window.scrollY;
+  }
   VISTA_ACTUAL = v;
   const req = NECESITA[v];
+
+  // Si la vista es viva y ya la teníamos construida, la restauramos tal cual:
+  // nada de recargar, nada de parpadeo.
+  if (VISTAS_VIVAS[v] && VISTA_HTML[v] !== undefined) {
+    $('content').innerHTML = VISTA_HTML[v];
+    reconectarVista(v);
+    window.scrollTo(0, VISTA_SCROLL[v] || 0);
+    return;
+  }
 
   if (req && req.accion) {
     const falta = req.claves.some((k) => DATA[k] === undefined || DATA[k] === null);
@@ -359,7 +381,21 @@ async function abrirVista(v) {
   else if (v === 'clientes') renderClientes();
   else if (v === 'admin') renderAdmin();
 }
-function reintentarVista(v) { abrirVista(v); }
+function reintentarVista(v) { borrarVistaViva(v); abrirVista(v); }
+
+/* Cuando una vista cambió (por una venta, compra, etc.) su HTML guardado
+   deja de ser valido: lo borramos para que se reconstruya al volver. */
+function borrarVistaViva(v) { delete VISTA_HTML[v]; delete VISTA_SCROLL[v]; }
+
+/* Al restaurar el HTML guardado, los botones perdieron sus eventos
+   (el navegador no guarda los listeners). Los reconectamos. */
+function reconectarVista(v) {
+  if (v === 'clientes') {
+    renderClientes();
+  } else if (v === 'dashboard') {
+    const r = $('btnRefDash'); if (r) r.addEventListener('click', refrescarDashboard);
+  }
+}
 
 function pantallaError(mensaje, vista) {
   return '<div class="placeholder"><div class="ph-ico">&#9888;</div>'
@@ -593,6 +629,7 @@ async function refrescarDashboard() {
   try {
     DATA.dashboard = await api('dashboard');
     pintarDashboard(DATA.dashboard);
+    VISTA_HTML['dashboard'] = $('content').innerHTML;
     aviso('Datos actualizados', 'ok', 2000);
   } catch (e) {
     aviso(e.message, 'error');
@@ -617,13 +654,19 @@ function pintarDashboard(d) {
     '<tr><td>' + esc(s.nombre) + '</td><td class="tc">' + s.stock + '</td><td class="tc">' + s.minimo + '</td></tr>'
   ).join('') : '<tr><td colspan="3" class="empty">Todo con stock suficiente</td></tr>';
 
-  const maxV = d.masVendidos.length ? Math.max.apply(null, d.masVendidos.map((x) => x.cantidad)) : 1;
-  const vend = d.masVendidos.length ? d.masVendidos.map((v) => {
-    const pct = Math.round(v.cantidad / maxV * 100);
-    return '<div class="bar-row"><span class="bar-lbl">' + esc(v.producto) + '</span>'
-      + '<div class="bar-track"><div class="bar-fill" style="width:' + pct + '%"></div></div>'
-      + '<span class="bar-val">' + v.cantidad + '</span></div>';
-  }).join('') : '<p class="empty">Sin ventas</p>';
+  const barrasTop = (lista, color) => {
+    if (!lista || !lista.length) return '<p class="empty">Sin datos</p>';
+    const max = Math.max.apply(null, lista.map((x) => x.cantidad).concat([1]));
+    return lista.map((v, i) => {
+      const pct = Math.max(3, Math.round(v.cantidad / max * 100));
+      return '<div class="bar-row"><span class="bar-rank">' + (i + 1) + '</span>'
+        + '<span class="bar-lbl">' + esc(v.producto) + '</span>'
+        + '<div class="bar-track"><div class="bar-fill" style="width:' + pct + '%;background:' + color + '"></div></div>'
+        + '<span class="bar-val">' + v.cantidad + '</span></div>';
+    }).join('');
+  };
+  const topMas = barrasTop(d.masVendidos, 'linear-gradient(90deg,#2ea86a,#4ad395)');
+  const topMenos = barrasTop(d.menosVendidos, 'linear-gradient(90deg,#b06a1d,#e0a83a)');
 
   const vendedores = d.vendedores.length ? d.vendedores.map((v) =>
     '<tr><td>' + esc(v.vendedor) + '</td><td class="tc">' + v.ventas + '</td><td class="tc">' + money(v.total) + '</td></tr>'
@@ -645,9 +688,11 @@ function pintarDashboard(d) {
     + '<div class="grid-2">'
     + panel('&#9888; Próximos a vencer / vencidos', '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Producto</th><th class="hide-sm">Lote</th><th class="tc">Stock</th><th class="tc hide-sm">Vence</th><th class="tc">Estado</th></tr></thead><tbody>' + alertas + '</tbody></table></div>')
     + panel('&#128201; Poco stock', '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Producto</th><th class="tc">Stock</th><th class="tc">Mínimo</th></tr></thead><tbody>' + stock + '</tbody></table></div>')
-    + '</div><div class="grid-2">'
+    + '</div><div class="grid-1">'
     + panel('&#128200; Ventas (6 meses)', '<div class="chart-wrap"><svg viewBox="0 0 ' + w + ' ' + (chartH + 26) + '" width="100%" height="190">' + barras + '</svg></div>')
-    + panel('&#127942; Más vendidos', '<div class="bars">' + vend + '</div>')
+    + '</div><div class="grid-2">'
+    + panel('&#127942; Top 15 más vendidos', '<div class="bars bars-top">' + topMas + '</div>')
+    + panel('&#128201; Top 15 menos vendidos', '<div class="bars bars-top">' + topMenos + '</div>')
     + '</div><div class="grid-1">'
     + panel('&#128101; Ventas por vendedor (mes)', '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Vendedor</th><th class="tc">Ventas</th><th class="tc">Total</th></tr></thead><tbody>' + vendedores + '</tbody></table></div>')
     + '</div></div>';
@@ -817,6 +862,7 @@ async function cobrar() {
       if (b) filtrarProd(b.value);
     }).catch(() => {});
     DATA.dashboard = null; DATA.inventario = null;
+    borrarVistaViva('dashboard');
   } catch (e) {
     msg.innerHTML = '<span class="err">' + esc(e.message) + '</span>';
     sonidoError();
@@ -866,8 +912,17 @@ function imprimirTicket() {
 /* =================================================================
    INVENTARIO
    ================================================================= */
+let INV_FILTRO = 'todos'; // todos | vencido | alerta | bajo
 function renderInventario() {
   if (!DATA.inventario) { $('content').innerHTML = '<div class="placeholder"><h2>Inventario</h2><p>Sin permiso.</p></div>'; return; }
+  INV_FILTRO = 'todos';
+
+  // Contadores para las pastillas de filtro
+  const activos = DATA.inventario.filter((p) => String(p.estado).toLowerCase() !== 'descontinuado');
+  const nVencidos = activos.filter((p) => p.estadoVenc === 'vencido').length;
+  const nAlerta = activos.filter((p) => p.estadoVenc === 'alerta').length;
+  const nBajo = activos.filter((p) => p.stockMin > 0 && p.stock <= p.stockMin).length;
+
   $('content').innerHTML = '<div class="card wide">'
     + '<div class="card-head"><h2>&#128230; Inventario</h2>'
     + '<div class="head-acts">'
@@ -875,39 +930,72 @@ function renderInventario() {
     + '  <button class="btn ghost" id="invScan">&#128247; Escanear</button>'
     + '  <button class="btn" id="invNuevo">+ Producto</button>'
     + '</div></div>'
-    + '<input class="inp" id="invBuscar" placeholder="Buscar por nombre o código..." autocomplete="off" style="margin-bottom:14px">'
+    + '<input class="inp" id="invBuscar" placeholder="Buscar por nombre, código, categoría o marca..." autocomplete="off" style="margin-bottom:12px">'
+    + '<div class="filtros" id="invFiltros">'
+    + '  <button class="filtro activo" data-f="todos">Todos <span class="fcount">' + activos.length + '</span></button>'
+    + '  <button class="filtro f-vencido" data-f="vencido">&#9888; Vencidos <span class="fcount">' + nVencidos + '</span></button>'
+    + '  <button class="filtro f-alerta" data-f="alerta">&#9200; Por vencer <span class="fcount">' + nAlerta + '</span></button>'
+    + '  <button class="filtro f-bajo" data-f="bajo">&#128201; Poco stock <span class="fcount">' + nBajo + '</span></button>'
+    + '</div>'
     + '<div class="tbl-wrap"><table class="tbl"><thead><tr>'
     + '<th class="hide-sm">Código</th><th>Producto</th>'
     + '<th class="tc hide-sm">Costo u.</th><th class="tc hide-sm">Costo caja</th>'
-    + '<th class="tc">Precio</th><th class="tc hide-sm">Margen</th><th class="tc">Stock</th><th></th>'
+    + '<th class="tc">Precio</th><th class="tc hide-sm">Margen</th>'
+    + '<th class="tc">Stock</th><th class="tc">Vence</th><th></th>'
     + '</tr></thead><tbody id="invBody"></tbody></table></div></div>';
 
   $('invBuscar').addEventListener('input', (e) => filasInventario(e.target.value));
   $('invRefresh').addEventListener('click', refrescarInventario);
   $('invScan').addEventListener('click', scanInventario);
   $('invNuevo').addEventListener('click', () => editarProducto(null));
+  document.querySelectorAll('#invFiltros .filtro').forEach((b) => b.addEventListener('click', () => {
+    document.querySelectorAll('#invFiltros .filtro').forEach((x) => x.classList.remove('activo'));
+    b.classList.add('activo');
+    INV_FILTRO = b.dataset.f;
+    filasInventario(val('invBuscar'));
+  }));
   filasInventario('');
 }
 function filasInventario(q) {
-  const lista = DATA.inventario.filter((p) =>
-    String(p.estado).toLowerCase() !== 'descontinuado' &&
-    (!q || contiene(p.nombre, q) || contiene(p.categoria, q) ||
-     contiene(p.marca, q) || (p.codigo && p.codigo.indexOf(String(q).trim()) >= 0))
-  );
+  const lista = DATA.inventario.filter((p) => {
+    if (String(p.estado).toLowerCase() === 'descontinuado') return false;
+    // Filtro por pastilla
+    if (INV_FILTRO === 'vencido' && p.estadoVenc !== 'vencido') return false;
+    if (INV_FILTRO === 'alerta' && p.estadoVenc !== 'alerta') return false;
+    if (INV_FILTRO === 'bajo' && !(p.stockMin > 0 && p.stock <= p.stockMin)) return false;
+    // Filtro por texto
+    return (!q || contiene(p.nombre, q) || contiene(p.categoria, q) ||
+      contiene(p.marca, q) || (p.codigo && p.codigo.indexOf(String(q).trim()) >= 0));
+  });
   $('invBody').innerHTML = lista.map((p) => {
     const bajo = p.stockMin > 0 && p.stock <= p.stockMin;
     const marg = (p.margen !== null && p.margen !== undefined) ? (p.margen + '%') : '-';
-    return '<tr>'
+    // Punto de color segun estado de vencimiento
+    let venceCell = '<span class="muted">—</span>';
+    let rowCls = '';
+    if (p.estadoVenc === 'vencido') {
+      venceCell = '<span class="v-badge vencido">&#9888; ' + p.vence + '</span>';
+      rowCls = 'row-vencido';
+    } else if (p.estadoVenc === 'alerta') {
+      venceCell = '<span class="v-badge alerta">' + p.diasVence + ' d</span>';
+      rowCls = 'row-alerta';
+    } else if (p.estadoVenc === 'ok') {
+      venceCell = '<span class="v-badge ok">' + p.vence + '</span>';
+    }
+    return '<tr class="' + rowCls + '">'
       + '<td class="hide-sm">' + esc(p.codigo || '') + '</td>'
-      + '<td>' + esc(p.nombre) + '<div class="sub-sm">' + esc(p.categoria || '') + (p.costoUnit ? (' &middot; costo ' + money(p.costoUnit)) : '') + '</div></td>'
+      + '<td>' + esc(p.nombre) + '<div class="sub-sm">' + esc(p.categoria || '')
+        + (p.estadoVenc === 'vencido' ? ' &middot; <span class="txt-venc">vencido</span>' : (p.estadoVenc === 'alerta' ? ' &middot; <span class="txt-alerta">vence en ' + p.diasVence + ' d</span>' : ''))
+        + '</div></td>'
       + '<td class="tc hide-sm">' + (p.costoUnit ? money(p.costoUnit) : '-') + '</td>'
       + '<td class="tc hide-sm">' + (p.costoCaja ? money(p.costoCaja) : '-') + '</td>'
       + '<td class="tc">' + money(p.precio) + '</td>'
       + '<td class="tc hide-sm">' + marg + '</td>'
       + '<td class="tc ' + (bajo ? 'txt-warn' : '') + '">' + p.stock + '</td>'
+      + '<td class="tc">' + venceCell + '</td>'
       + '<td class="acts"><button class="mini" onclick=\'editarProducto(' + JSON.stringify(p).replace(/'/g, '&#39;') + ')\'>&#9998;</button>'
       + '<button class="mini danger" onclick="eliminarProducto(' + p._row + ')">&#128465;</button></td></tr>';
-  }).join('') || '<tr><td colspan="8" class="empty">Sin coincidencias</td></tr>';
+  }).join('') || '<tr><td colspan="9" class="empty">Sin coincidencias</td></tr>';
 }
 async function refrescarInventario() {
   const btn = $('invRefresh');
@@ -996,6 +1084,7 @@ async function salvarProducto(row) {
     cerrarModal();
     aviso(row ? 'Producto actualizado' : 'Producto creado', 'ok');
     DATA.catalogo = null; DATA.dashboard = null;
+    borrarVistaViva('dashboard');
     await refrescarInventario();
   } catch (e) {
     msg.innerHTML = '<span class="err">' + esc(e.message) + '</span>';
@@ -1015,6 +1104,7 @@ async function eliminarProducto(row) {
     await api('eliminarProducto', { row });
     aviso('Producto descontinuado', 'ok');
     DATA.catalogo = null; DATA.dashboard = null;
+    borrarVistaViva('dashboard');
     await refrescarInventario();
   } catch (e) { aviso(e.message, 'error'); }
 }
@@ -1123,6 +1213,7 @@ async function registrarCompra() {
     aviso('Compra ' + r.idCompra + ' registrada — ' + money(r.total), 'ok', 3800);
     COMPRA = []; pintarCompra();
     DATA.inventario = null; DATA.catalogo = null; DATA.dashboard = null;
+    borrarVistaViva('dashboard');
   } catch (e) {
     msg.innerHTML = '<span class="err">' + esc(e.message) + '</span>';
     sonidoError();
