@@ -440,3 +440,16 @@ main{padding:18px 16px 44px}
   .filtros{gap:6px}
   .filtro{padding:8px 11px;font-size:12px}
 }
+
+/* ===============================================================
+   TABLA RANKING (Top 15 menos vendidos)
+   =============================================================== */
+.tbl-rank{max-height:430px}
+.tbl-rank tbody{display:block;max-height:388px;overflow-y:auto}
+.tbl-rank thead,.tbl-rank tbody tr{display:table;width:100%;table-layout:fixed}
+.rank-num{
+  display:inline-flex;align-items:center;justify-content:center;
+  width:24px;height:24px;border-radius:6px;background:#22304d;
+  color:#9fb0d4;font-size:12px;font-weight:700
+}
+.dash-head{gap:8px}

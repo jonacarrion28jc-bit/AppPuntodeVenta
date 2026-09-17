@@ -212,6 +212,7 @@ window.addEventListener('load', async () => {
       SESION = JSON.parse(sesGuardada);
       $('splash').style.display = 'none';
       iniciarApp();
+      precargarTodo();
       return;
     } catch (e) {}
   }
@@ -255,12 +256,30 @@ async function hacerLogin() {
     msg.innerHTML = '';
     $('logPin').value = '';
     iniciarApp();
+    precargarTodo();
     aviso('Bienvenido, ' + SESION.Nombre.split(' ')[0], 'ok', 2600);
   } catch (e) {
     msg.innerHTML = '<span class="err">' + esc(e.message) + '</span>';
     sonidoError();
   } finally {
     $('btnLogin').disabled = false;
+  }
+}
+
+/* Trae TODOS los datos en un solo viaje y los deja en memoria.
+   Desde aqui, cambiar de pestaña es instantaneo: no se pide nada mas.
+   Si falla, cada pestaña reintentara por su cuenta al abrirse. */
+let PRECARGADO = false;
+async function precargarTodo() {
+  try {
+    const d = await api('todo', {}, 4);
+    Object.assign(DATA, d);
+    PRECARGADO = true;
+    // Redibuja la pestaña actual ya con datos (p.ej. el dashboard)
+    if (VISTA_ACTUAL) { borrarVistaViva(VISTA_ACTUAL); abrirVista(VISTA_ACTUAL); }
+  } catch (e) {
+    // No pasa nada: cada pestaña cargara sus datos cuando se abra
+    PRECARGADO = true;
   }
 }
 
@@ -358,6 +377,15 @@ async function abrirVista(v) {
     return;
   }
 
+  // Si el usuario NO tiene permiso para esta vista, mensaje claro y salir.
+  const permisoDe = { dashboard: 'Dashboard', ventas: 'Ventas', inventario: 'Inventario', compras: 'Compras', clientes: 'Clientes', admin: 'Admin_Usuarios' };
+  const pk = permisoDe[v];
+  if (pk && SESION.permisos && SESION.permisos[pk] === false) {
+    $('content').innerHTML = '<div class="placeholder"><div class="ph-ico">&#128274;</div>'
+      + '<h2>Sin acceso</h2><p>Tu rol no tiene permiso para ver este módulo.</p></div>';
+    return;
+  }
+
   if (req && req.accion) {
     const falta = req.claves.some((k) => DATA[k] === undefined || DATA[k] === null);
     if (falta) {
@@ -394,6 +422,7 @@ function reconectarVista(v) {
     renderClientes();
   } else if (v === 'dashboard') {
     const r = $('btnRefDash'); if (r) r.addEventListener('click', refrescarDashboard);
+    const rep = $('btnReporte'); if (rep) rep.addEventListener('click', descargarReporteVentas);
   }
 }
 
@@ -617,10 +646,7 @@ function cerrarScanner() {
    DASHBOARD
    ================================================================= */
 function renderDashboard() {
-  if (!DATA.dashboard) {
-    $('content').innerHTML = '<div class="placeholder"><h2>Dashboard</h2><p>Sin permiso para ver este módulo.</p></div>';
-    return;
-  }
+  if (!DATA.dashboard) { $('content').innerHTML = pantallaError('No se pudieron cargar los datos del panel.', 'dashboard'); return; }
   pintarDashboard(DATA.dashboard);
 }
 async function refrescarDashboard() {
@@ -666,7 +692,16 @@ function pintarDashboard(d) {
     }).join('');
   };
   const topMas = barrasTop(d.masVendidos, 'linear-gradient(90deg,#2ea86a,#4ad395)');
-  const topMenos = barrasTop(d.menosVendidos, 'linear-gradient(90deg,#b06a1d,#e0a83a)');
+
+  // Menos vendidos: tabla ranking. Mas claro para detectar productos estancados.
+  const topMenos = (d.menosVendidos && d.menosVendidos.length) ? d.menosVendidos.map((v, i) => {
+    const cero = v.cantidad === 0;
+    const badge = cero
+      ? '<span class="v-badge vencido">Sin ventas</span>'
+      : '<span class="v-badge alerta">' + v.cantidad + '</span>';
+    return '<tr><td class="tc"><span class="rank-num">' + (i + 1) + '</span></td>'
+      + '<td>' + esc(v.producto) + '</td><td class="tc">' + badge + '</td></tr>';
+  }).join('') : '<tr><td colspan="3" class="empty">Sin datos</td></tr>';
 
   const vendedores = d.vendedores.length ? d.vendedores.map((v) =>
     '<tr><td>' + esc(v.vendedor) + '</td><td class="tc">' + v.ventas + '</td><td class="tc">' + money(v.total) + '</td></tr>'
@@ -683,7 +718,10 @@ function pintarDashboard(d) {
   const w = d.mensual.length * (bw + gap) + 10;
 
   $('content').innerHTML = '<div class="dash">'
-    + '<div class="dash-head"><button class="btn ghost" id="btnRefDash" onclick="refrescarDashboard()">&#128260; Actualizar</button></div>'
+    + '<div class="dash-head">'
+    + '  <button class="btn ghost" id="btnReporte" onclick="descargarReporteVentas()">&#128202; Reporte Excel</button>'
+    + '  <button class="btn ghost" id="btnRefDash" onclick="refrescarDashboard()">&#128260; Actualizar</button>'
+    + '</div>'
     + '<div class="kpi-grid">' + kpis + '</div>'
     + '<div class="grid-2">'
     + panel('&#9888; Próximos a vencer / vencidos', '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Producto</th><th class="hide-sm">Lote</th><th class="tc">Stock</th><th class="tc hide-sm">Vence</th><th class="tc">Estado</th></tr></thead><tbody>' + alertas + '</tbody></table></div>')
@@ -692,11 +730,62 @@ function pintarDashboard(d) {
     + panel('&#128200; Ventas (6 meses)', '<div class="chart-wrap"><svg viewBox="0 0 ' + w + ' ' + (chartH + 26) + '" width="100%" height="190">' + barras + '</svg></div>')
     + '</div><div class="grid-2">'
     + panel('&#127942; Top 15 más vendidos', '<div class="bars bars-top">' + topMas + '</div>')
-    + panel('&#128201; Top 15 menos vendidos', '<div class="bars bars-top">' + topMenos + '</div>')
+    + panel('&#128203; Top 15 menos vendidos', '<div class="tbl-wrap"><table class="tbl tbl-rank"><thead><tr><th class="tc">#</th><th>Producto</th><th class="tc">Vendidos</th></tr></thead><tbody>' + topMenos + '</tbody></table></div>')
     + '</div><div class="grid-1">'
     + panel('&#128101; Ventas por vendedor (mes)', '<div class="tbl-wrap"><table class="tbl"><thead><tr><th>Vendedor</th><th class="tc">Ventas</th><th class="tc">Total</th></tr></thead><tbody>' + vendedores + '</tbody></table></div>')
     + '</div></div>';
 }
+/* =================================================================
+   REPORTE EXCEL: productos vendidos y no vendidos
+   Genera un .xlsx real en el navegador con SheetJS (carga bajo demanda).
+   ================================================================= */
+async function cargarSheetJS() {
+  if (window.XLSX) return window.XLSX;
+  await new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = 'https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js';
+    s.onload = resolve; s.onerror = reject;
+    document.head.appendChild(s);
+  });
+  return window.XLSX;
+}
+async function descargarReporteVentas() {
+  const btn = $('btnReporte');
+  if (btn) { btn.disabled = true; btn.innerHTML = '&#128202; Generando...'; }
+  try {
+    const XLSX = await cargarSheetJS();
+    const rep = await api('reporteVentas');
+    const moneda = rep.moneda || 'C$';
+
+    // Encabezados + filas
+    const datos = [['Código', 'Producto', 'Categoría', 'Cantidad vendida', 'Monto (' + moneda + ')']];
+    let totalCant = 0, totalMonto = 0;
+    rep.filas.forEach((f) => {
+      datos.push([f.codigo || '', f.producto, f.categoria || '', f.cantidad, Number(f.monto.toFixed(2))]);
+      totalCant += f.cantidad; totalMonto += f.monto;
+    });
+    datos.push([]); // fila en blanco
+    datos.push(['', '', 'TOTAL', totalCant, Number(totalMonto.toFixed(2))]);
+
+    const ws = XLSX.utils.aoa_to_sheet(datos);
+    ws['!cols'] = [{ wch: 16 }, { wch: 34 }, { wch: 18 }, { wch: 16 }, { wch: 16 }];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, 'Productos vendidos');
+
+    const hoy = new Date();
+    const nombre = 'Reporte_Ventas_' + hoy.getFullYear()
+      + String(hoy.getMonth() + 1).padStart(2, '0')
+      + String(hoy.getDate()).padStart(2, '0') + '.xlsx';
+    XLSX.writeFile(wb, nombre);
+    aviso('Reporte descargado: ' + rep.filas.length + ' productos', 'ok', 3200);
+  } catch (e) {
+    aviso('No se pudo generar el reporte: ' + e.message, 'error', 4200);
+    sonidoError();
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = '&#128202; Reporte Excel'; }
+  }
+}
+
 function kpi(i, t, v, s, e) {
   return '<div class="kpi ' + (e || '') + '"><div class="kpi-ico">' + i + '</div><div class="kpi-body">'
     + '<div class="kpi-val">' + v + '</div><div class="kpi-tit">' + t + '</div><div class="kpi-sub">' + s + '</div></div></div>';
@@ -708,7 +797,7 @@ function panel(t, c) { return '<div class="panel"><div class="panel-tit">' + t +
    ================================================================= */
 let CARRITO = [];
 function renderVentas() {
-  if (!DATA.catalogo) { $('content').innerHTML = '<div class="placeholder"><h2>Ventas</h2><p>Sin permiso.</p></div>'; return; }
+  if (!DATA.catalogo) { $('content').innerHTML = pantallaError('No se pudo cargar el catálogo.', 'ventas'); return; }
   CARRITO = [];
   $('content').innerHTML = '<div class="pos">'
     + '<div class="pos-left">'
@@ -914,7 +1003,7 @@ function imprimirTicket() {
    ================================================================= */
 let INV_FILTRO = 'todos'; // todos | vencido | alerta | bajo
 function renderInventario() {
-  if (!DATA.inventario) { $('content').innerHTML = '<div class="placeholder"><h2>Inventario</h2><p>Sin permiso.</p></div>'; return; }
+  if (!DATA.inventario) { $('content').innerHTML = pantallaError('No se pudo cargar el inventario.', 'inventario'); return; }
   INV_FILTRO = 'todos';
 
   // Contadores para las pastillas de filtro
@@ -1114,7 +1203,7 @@ async function eliminarProducto(row) {
    ================================================================= */
 let COMPRA = [];
 function renderCompras() {
-  if (!DATA.proveedores) { $('content').innerHTML = '<div class="placeholder"><h2>Compras</h2><p>Sin permiso.</p></div>'; return; }
+  if (!DATA.proveedores) { $('content').innerHTML = pantallaError('No se pudieron cargar los proveedores.', 'compras'); return; }
   COMPRA = [];
   const ops = '<option value="">Selecciona proveedor...</option>'
     + DATA.proveedores.map((p) => '<option value="' + p.id + '">' + esc(p.nombre) + '</option>').join('');
