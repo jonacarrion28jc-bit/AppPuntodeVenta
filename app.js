@@ -844,29 +844,52 @@ function filtrarProd(q) {
   }).join('') || '<p class="empty">Sin coincidencias</p>';
 }
 /** Busca en memoria primero: instantaneo, sin viajar al servidor. */
+/** Normaliza un código de barras para comparar: sin espacios, y sin
+    ceros a la izquierda (Sheets a veces se los come al guardar). */
+function codClave(c) {
+  let s = String(c == null ? '' : c).replace(/\s+/g, '');
+  // notacion cientifica -> numero plano
+  if (/^[0-9.]+e\+?\d+$/i.test(s)) { const n = Number(s); if (!isNaN(n)) s = n.toFixed(0); }
+  s = s.replace(/\.0$/, '');
+  const sinCeros = s.replace(/^0+/, '');
+  return { exacto: s, flexible: sinCeros || s };
+}
+function codigosCoinciden(a, b) {
+  const ca = codClave(a), cb = codClave(b);
+  if (ca.exacto && ca.exacto === cb.exacto) return true;
+  if (ca.flexible && ca.flexible === cb.flexible) return true;
+  return false;
+}
 function buscarLocal(lista, texto) {
   const t = String(texto || '').trim();
   if (!t || !lista) return null;
-  return lista.filter((p) => p.codigo === t || String(p.id).toLowerCase() === t.toLowerCase())[0] || null;
+  // 1) por codigo (tolerante) 2) por id interno
+  let hit = lista.filter((p) => p.codigo && codigosCoinciden(p.codigo, t))[0];
+  if (!hit) hit = lista.filter((p) => String(p.id).toLowerCase() === t.toLowerCase())[0];
+  return hit || null;
 }
-function escaneoVenta(t) {
+async function escaneoVenta(t) {
   t = String(t || '').trim();
   if (!t) return;
-  const local = buscarLocal(DATA.catalogo, t);
-  if (local) {
-    agregarObj(local);
-    scanHistorial(local.nombre, 'ok');
-    return;
-  }
-  // No esta en memoria: preguntamos al servidor
+  // 1) Buscar en memoria (instantaneo)
+  let local = buscarLocal(DATA.catalogo, t);
+  if (local) { agregarObj(local); scanHistorial(local.nombre, 'ok'); return; }
+  // 2) Refrescar catalogo por si se creo/cambio un producto y reintentar
   scanHistorial('Buscando ' + t + '...', 'ok');
-  api('buscarProducto', { texto: t })
-    .then((p) => { agregarObj(p); scanHistorial(p.nombre, 'ok'); })
-    .catch(() => {
-      sonidoError();
-      scanHistorial('No existe: ' + t, 'err');
-      aviso('No se encontró el producto con código ' + t, 'error');
-    });
+  try {
+    DATA.catalogo = await api('catalogo');
+    local = buscarLocal(DATA.catalogo, t);
+    if (local) { agregarObj(local); scanHistorial(local.nombre, 'ok'); return; }
+  } catch (e) {}
+  // 3) Ultimo intento: preguntar directo al servidor
+  try {
+    const p = await api('buscarProducto', { texto: t });
+    agregarObj(p); scanHistorial(p.nombre, 'ok');
+  } catch (e) {
+    sonidoError();
+    scanHistorial('No existe: ' + t, 'err');
+    aviso('No se encontró el producto con código ' + t, 'error');
+  }
 }
 function filtrarClientes(q) {
   const drop = $('cliLista');
@@ -1097,10 +1120,14 @@ async function refrescarInventario() {
   } catch (e) { aviso(e.message, 'error'); }
   finally { if (btn) btn.disabled = false; }
 }
-/** Escaneo en inventario: busca primero en memoria (instantaneo). */
+/** Escaneo en inventario: busca primero en memoria, y si no aparece
+    refresca desde el servidor antes de ofrecer crear uno nuevo. */
 function scanInventario() {
   abrirScanner(async (t) => {
-    const local = buscarLocal(DATA.inventario, t);
+    let local = buscarLocal(DATA.inventario, t);
+    if (local) { editarProducto(local); return; }
+    // Refrescar por si el producto se creó recientemente
+    try { DATA.inventario = await api('inventario'); local = buscarLocal(DATA.inventario, t); } catch (e) {}
     if (local) { editarProducto(local); return; }
     const ok = await preguntar({
       titulo: 'Producto no registrado',
@@ -1237,8 +1264,11 @@ function filasCompraProd(q) {
   ).join('') || '<p class="empty">Sin coincidencias</p>';
 }
 function scanCompra() {
-  abrirScanner((t) => {
-    const local = buscarLocal(DATA.inventario, t);
+  abrirScanner(async (t) => {
+    let local = buscarLocal(DATA.inventario, t);
+    if (!local) {
+      try { DATA.inventario = await api('inventario'); local = buscarLocal(DATA.inventario, t); } catch (e) {}
+    }
     if (local) {
       addCompra({ id: local.id, nombre: local.nombre, controla: local.controla, costo: local.costoUnit });
       scanHistorial(local.nombre, 'ok');
